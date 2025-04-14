@@ -1,41 +1,17 @@
 package com.mongodb.mongo2bq;
 
-import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
-import org.apache.arrow.memory.RootAllocator;
-import org.apache.arrow.vector.FieldVector;
-import org.apache.arrow.vector.VectorSchemaRoot;
-import org.apache.arrow.vector.ipc.ArrowStreamWriter;
 import org.bson.Document;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import com.google.api.gax.rpc.BidiStream;
-import com.google.cloud.bigquery.storage.v1.AppendRowsRequest;
-import com.google.cloud.bigquery.storage.v1.AppendRowsResponse;
-import com.google.cloud.bigquery.storage.v1.BatchCommitWriteStreamsRequest;
-import com.google.cloud.bigquery.storage.v1.BatchCommitWriteStreamsResponse;
-import com.google.cloud.bigquery.storage.v1.BigQueryWriteClient;
-import com.google.cloud.bigquery.storage.v1.CreateWriteStreamRequest;
-import com.google.cloud.bigquery.storage.v1.FinalizeWriteStreamRequest;
-import com.google.cloud.bigquery.storage.v1.ProtoRows;
-import com.google.cloud.bigquery.storage.v1.StorageError;
-import com.google.cloud.bigquery.storage.v1.TableName;
-import com.google.cloud.bigquery.storage.v1.WriteStream;
-import com.google.protobuf.ByteString;
-import com.mongodb.client.FindIterable;
 import com.mongodb.client.MongoClient;
-import com.mongodb.client.MongoCollection;
-import com.mongodb.client.MongoCursor;
 
 import picocli.CommandLine;
 import picocli.CommandLine.Command;

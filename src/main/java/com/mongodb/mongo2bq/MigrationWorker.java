@@ -2,7 +2,9 @@ package com.mongodb.mongo2bq;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Iterator;
 import java.util.List;
+import java.util.Set;
 
 import org.bson.Document;
 import org.slf4j.Logger;
@@ -17,6 +19,7 @@ import com.google.cloud.bigquery.storage.v1.BatchCommitWriteStreamsResponse;
 import com.google.cloud.bigquery.storage.v1.BigQueryWriteClient;
 import com.google.cloud.bigquery.storage.v1.CreateWriteStreamRequest;
 import com.google.cloud.bigquery.storage.v1.FinalizeWriteStreamRequest;
+import com.google.cloud.bigquery.storage.v1.FinalizeWriteStreamResponse;
 import com.google.cloud.bigquery.storage.v1.StorageError;
 import com.google.cloud.bigquery.storage.v1.TableName;
 import com.google.cloud.bigquery.storage.v1.WriteStream;
@@ -27,264 +30,292 @@ import com.mongodb.client.MongoCursor;
 import com.mongodb.client.MongoDatabase;
 
 public class MigrationWorker implements Runnable {
-    
-    private static final Logger logger = LoggerFactory.getLogger(MigrationWorker.class);
-    
-    private MongoToBigQueryConfig config;
-    private MongoClient mongoClient;
-    private Namespace ns;
-    private Document collectionInfo;
-    
-    public MigrationWorker(MongoToBigQueryConfig config, String mongoClientName, Namespace ns, Document collectionInfo) {
-        this.config = config;
-        this.mongoClient = config.getMongoClient(mongoClientName);
-        this.ns = ns;
-        this.collectionInfo = collectionInfo;
-    }
 
-    @Override
-    public void run() {
-        TableId tableId = TableId.of(config.getBqDatasetName(), ns.getDatabaseName() + "_" + ns.getCollectionName());
-        MongoDatabase db = mongoClient.getDatabase(ns.getDatabaseName());
-        
-        if (!BigQueryHelper.tableExists(config.getBigQuery(), tableId)) {
-            BigQueryHelper.createBigQueryTable(config.getBigQuery(), db.getCollection(ns.getCollectionName()), tableId);
-        } else {
-            logger.debug("BigQuery table already exists", tableId);
-        }
-        processCollection(config.getBigQueryClient(), db.getCollection(ns.getCollectionName()), ns.getDatabaseName(), collectionInfo);
-    }
-    
-    private void processCollection(BigQueryWriteClient client, MongoCollection<Document> collection, String dbName,
-            Document collectionInfo) {
-        try {
-            String collectionType = collectionInfo.getString("type");
-            String collectionName = collectionInfo.getString("name");
-            String tableName = dbName + "_" + collectionName;
-            String parentTable = TableName.of(config.getGcpProjectId(), config.getBqDatasetName(), tableName)
-                    .toString();
+	private static final Logger logger = LoggerFactory.getLogger(MigrationWorker.class);
 
-            WriteStream stream = WriteStream.newBuilder().setType(WriteStream.Type.PENDING).build();
-            WriteStream writeStream = client.createWriteStream(
-                    CreateWriteStreamRequest.newBuilder().setParent(parentTable).setWriteStream(stream).build());
-            String streamName = writeStream.getName();
+	private MongoToBigQueryConfig config;
+	private MongoClient mongoClient;
+	private Namespace ns;
+	private Document collectionInfo;
+	private ProtoSchemaConverter converter;
 
-            BidiStream<AppendRowsRequest, AppendRowsResponse> bidiStream = client.appendRowsCallable().call();
-            logger.info("Processing MongoDB Collection: {}.{}", dbName, collectionName);
+	public MigrationWorker(MongoToBigQueryConfig config, String mongoClientName, Namespace ns,
+			Document collectionInfo) {
+		this.config = config;
+		this.mongoClient = config.getMongoClient(mongoClientName);
+		this.ns = ns;
+		this.collectionInfo = collectionInfo;
+		converter = new ProtoSchemaConverter(config);
+	}
 
-            // Sample some documents to generate schema
-            List<Document> sampleDocs = collection.find().limit(10).into(new ArrayList<>());
-            if (!sampleDocs.isEmpty()) {
-                // Generate schema based on sample documents
-                ProtoSchemaConverter.generateProtoSchema(sampleDocs, tableName);
-            }
+	@Override
+	public void run() {
+		TableId tableId = TableId.of(config.getBqDatasetName(), ns.getDatabaseName() + "_" + ns.getCollectionName());
+		MongoDatabase db = mongoClient.getDatabase(ns.getDatabaseName());
 
-            if ("collection".equals(collectionType)) {
-                processRegularCollection(collection, streamName, bidiStream, dbName, collectionName, tableName);
-            } else if ("timeseries".equals(collectionType)) {
-                processTimeSeriesCollection(collection, collectionInfo, streamName, bidiStream, dbName, collectionName, tableName);
-            } else {
-                logger.debug("Skipping collection type: {}, name: {}", collectionType, collectionName);
-                return;
-            }
+		if (!BigQueryHelper.tableExists(config.getBigQuery(), tableId)) {
+			BigQueryHelper.createBigQueryTable(config.getBigQuery(), db.getCollection(ns.getCollectionName()), tableId);
+		} else {
+			logger.debug("BigQuery table already exists", tableId);
+		}
+		processCollection(config.getBigQueryClient(), db.getCollection(ns.getCollectionName()), ns.getDatabaseName(),
+				collectionInfo);
+	}
 
-            bidiStream.closeSend();
-            
-            FinalizeWriteStreamRequest finalizeRequest = FinalizeWriteStreamRequest.newBuilder().setName(streamName)
-                    .build();
-            client.finalizeWriteStream(finalizeRequest);
+	private void processCollection(BigQueryWriteClient client, MongoCollection<Document> collection, String dbName,
+			Document collectionInfo) {
+		
+		String collectionName = collectionInfo.getString("name");
+		try {
+			String collectionType = collectionInfo.getString("type");
+			String tableName = dbName + "_" + collectionName;
+			String parentTable = TableName.of(config.getGcpProjectId(), config.getBqDatasetName(), tableName)
+					.toString();
 
-            BatchCommitWriteStreamsRequest commitRequest = BatchCommitWriteStreamsRequest.newBuilder()
-                    .setParent(parentTable).addWriteStreams(streamName).build();
-            BatchCommitWriteStreamsResponse commitResponse = client.batchCommitWriteStreams(commitRequest);
+			WriteStream stream = WriteStream.newBuilder().setType(WriteStream.Type.PENDING).build();
+			WriteStream writeStream = client.createWriteStream(
+					CreateWriteStreamRequest.newBuilder().setParent(parentTable).setWriteStream(stream).build());
+			String streamName = writeStream.getName();
 
-            List<StorageError> errors = commitResponse.getStreamErrorsList();
-            for (StorageError e : errors) {
-                logger.error(e.getErrorMessage());
-            }
+			logger.info("Processing MongoDB Collection: {}.{}", dbName, collectionName);
 
-            if (commitResponse.hasCommitTime()) {
-                logger.info("Data committed to BigQuery table {} at {}", tableName, commitResponse.getCommitTime());
-            } else {
-                logger.error("Commit failed for table {}", tableName);
-            }
+			// Sample some documents to generate schema
+//			List<Document> sampleDocs = collection.find().limit(10).into(new ArrayList<>());
+//			if (!sampleDocs.isEmpty()) {
+//				// Generate schema based on sample documents
+//				converter.generateProtoSchema(sampleDocs, tableName);
+//			}
 
-        } catch (Exception e) {
-            logger.error("Error processing collection {}.{}", dbName, collectionInfo, e);
-        }
-    }
+			if ("collection".equals(collectionType)) {
+				processRegularCollection(collection, streamName, dbName, collectionName, tableName);
+			} else if ("timeseries".equals(collectionType)) {
+				processTimeSeriesCollection(collection, collectionInfo, streamName, dbName, collectionName, tableName);
+			} else {
+				logger.debug("Skipping collection type: {}, name: {}", collectionType, collectionName);
+				return;
+			}
 
-    private void processRegularCollection(MongoCollection<Document> collection, String streamName,
-            BidiStream<AppendRowsRequest, AppendRowsResponse> bidiStream, String dbName, String collectionName, String tableName) {
-        // Start with initial sort on _id
-        Document sort = new Document("_id", 1);
-        Object lastId = null;
-        boolean isFirstBatch = true;
-        boolean includeSchema = true;  // Include schema in first request
+			// bidiStream.closeSend();
 
-        while (true) {
-            // Build query - for subsequent batches, filter by _id > lastId
-            FindIterable<Document> docs;
-            if (isFirstBatch) {
-                docs = collection.find().sort(sort).limit(config.getBatchSize());
-                isFirstBatch = false;
-            } else {
-                docs = collection.find(new Document("_id", new Document("$gt", lastId))).sort(sort)
-                        .limit(config.getBatchSize());
-            }
+			FinalizeWriteStreamRequest finalizeRequest = FinalizeWriteStreamRequest.newBuilder().setName(streamName)
+					.build();
+			FinalizeWriteStreamResponse finalizeResponse = client.finalizeWriteStream(finalizeRequest);
+			logger.info("Finalized stream with row count: {}", finalizeResponse.getRowCount());
 
-            // Process batch
-            List<Document> batch = new ArrayList<>(config.getBatchSize());
-            MongoCursor<Document> cursor = docs.iterator();
-            int count = 0;
+			BatchCommitWriteStreamsRequest commitRequest = BatchCommitWriteStreamsRequest.newBuilder()
+					.setParent(parentTable).addWriteStreams(streamName).build();
+			BatchCommitWriteStreamsResponse commitResponse = client.batchCommitWriteStreams(commitRequest);
 
-            while (cursor.hasNext()) {
-                Document doc = cursor.next();
-                batch.add(doc);
-                lastId = doc.get("_id");
-                count++;
-            }
+			List<StorageError> errors = commitResponse.getStreamErrorsList();
+			for (StorageError e : errors) {
+				logger.error(e.getErrorMessage());
+			}
 
-            // If we got no documents, we're done
-            if (count == 0) {
-                break;
-            }
+			if (commitResponse.hasCommitTime()) {
+				logger.info("Data committed to BigQuery table {} at {}", tableName, commitResponse.getCommitTime());
+			} else {
+				logger.error("Commit failed for table {}", tableName);
+			}
 
-            // Send batch to BigQuery
-            logger.info("Sending batch of {} documents from {}.{} (regular collection)", batch.size(), dbName,
-                    collectionName);
-            try {
-                convertAndSendBatch(batch, streamName, bidiStream, tableName, includeSchema);
-                includeSchema = false;  // Only include schema in first batch
-            } catch (IOException e) {
-                logger.error("Error sending batch", e);
-            }
+		} catch (Exception e) {
+			logger.error("Error processing collection {}.{}", dbName, collectionName, e);
+		}
+	}
 
-            // If we got fewer documents than config.getBatchSize(), we're done
-            if (count < config.getBatchSize()) {
-                break;
-            }
-        }
-    }
+	private void processRegularCollection(MongoCollection<Document> collection, String streamName, String dbName,
+			String collectionName, String tableName) {
+		// Start with initial sort on _id
+		Document sort = new Document("_id", 1);
+		Object lastId = null;
+		boolean isFirstBatch = true;
+		boolean includeSchema = true; // Include schema in first request
 
-    private void convertAndSendBatch(List<Document> batch, String streamName,
-            BidiStream<AppendRowsRequest, AppendRowsResponse> bidiStream, String tableName, boolean includeSchema) 
-            throws IOException {
-        AppendRowsRequest request = ProtoSchemaConverter.createAppendRequest(streamName, batch, tableName, includeSchema);
-        bidiStream.send(request);
-    }
+		while (true) {
+			// Build query - for subsequent batches, filter by _id > lastId
+			FindIterable<Document> docs;
+			if (isFirstBatch) {
+				docs = collection.find().sort(sort).limit(config.getBatchSize());
+				isFirstBatch = false;
+			} else {
+				docs = collection.find(new Document("_id", new Document("$gt", lastId))).sort(sort)
+						.limit(config.getBatchSize());
+			}
 
-    private void processTimeSeriesCollection(MongoCollection<Document> collection, Document collectionInfo,
-            String streamName, BidiStream<AppendRowsRequest, AppendRowsResponse> bidiStream, String dbName,
-            String collectionName, String tableName) {
-        // Extract timeField from collection info
-        Document options = (Document) collectionInfo.get("options");
-        Document timeseries = (Document) options.get("timeseries");
-        String timeField = timeseries.getString("timeField");
+			// Process batch
+			List<Document> batch = new ArrayList<>(config.getBatchSize());
+			MongoCursor<Document> cursor = docs.iterator();
+			int count = 0;
 
-        // Sort by timeField
-        Document sort = new Document(timeField, 1);
-        Object lastTimeValue = null;
-        boolean isFirstBatch = true;
-        Document savedLookaheadDoc = null;
-        boolean includeSchema = true;  // Include schema in first request
+			while (cursor.hasNext()) {
+				Document doc = cursor.next();
+				batch.add(doc);
+				lastId = doc.get("_id");
+				count++;
+			}
 
-        while (true) {
-            // Build query - for subsequent batches, filter by timeField > lastTimeValue
-            FindIterable<Document> docs;
-            if (isFirstBatch) {
-                docs = collection.find().sort(sort);
-                isFirstBatch = false;
-            } else {
-                Document query = new Document(timeField, new Document("$gt", lastTimeValue));
-                docs = collection.find(query).sort(sort);
-            }
+			// If we got no documents, we're done
+			if (count == 0) {
+				break;
+			}
 
-            // Process batch
-            List<Document> batch = new ArrayList<>(config.getBatchSize());
+			// Send batch to BigQuery
+			logger.info("Sending batch of {} documents from {}.{} (regular collection)", batch.size(), dbName,
+					collectionName);
+			try {
+				convertAndSendBatch(batch, streamName, tableName, includeSchema);
+				includeSchema = false; // Only include schema in first batch
+			} catch (IOException e) {
+				logger.error("Error sending batch", e);
+			}
 
-            // Add saved lookahead document from previous iteration if it exists
-            if (savedLookaheadDoc != null) {
-                batch.add(savedLookaheadDoc);
-                savedLookaheadDoc = null;
-            }
+			// If we got fewer documents than config.getBatchSize(), we're done
+			if (count < config.getBatchSize()) {
+				break;
+			}
+		}
+	}
 
-            MongoCursor<Document> cursor = docs.iterator();
+	private void convertAndSendBatch(List<Document> batch, String streamName, String tableName, boolean includeSchema)
+			throws IOException {
+		
+		// TODO -- don't do this every time
+		Set<String> allowedFields = BigQueryHelper.fetchBigQueryTableFields(config.getGcpProjectId(), config.getBqDatasetName(), tableName);
 
-            Object currentTimeValue = null;
-            boolean batchComplete = false;
-            int count = batch.size(); // Start with the count of any previously saved documents
+		AppendRowsRequest request = converter.createAppendRequest(streamName, batch, tableName,
+				true, allowedFields);
+		BidiStream<AppendRowsRequest, AppendRowsResponse> bidiStream = config.getBigQueryClient().appendRowsCallable()
+				.call();
+		bidiStream.send(request);
 
-            while (cursor.hasNext() && !batchComplete) {
-                Document doc = cursor.next();
-                currentTimeValue = doc.get(timeField);
+		// Wait for and process the response
+		Iterator<AppendRowsResponse> responseIter = bidiStream.iterator();
+		if (responseIter.hasNext()) {
+			AppendRowsResponse response = responseIter.next();
+			if (response != null && response.hasError()) {
+				logger.error("Error in append response: {}", response.getError().getMessage());
+				throw new IOException("Error appending rows: " + response.getError().getMessage());
+			} else if (response != null && response.hasAppendResult()) {
+				logger.info("Successfully appended batch with offset: {}",
+						response.getAppendResult().getOffset().getValue());
+			} else {
+				logger.warn("Received empty or incomplete response");
+			}
+		} else {
+			logger.warn("No response received for batch");
+		}
+	}
 
-                // Add document to batch
-                batch.add(doc);
-                count++;
+	private void processTimeSeriesCollection(MongoCollection<Document> collection, Document collectionInfo,
+			String streamName, String dbName, String collectionName, String tableName) {
+		
+		// Extract timeField from collection info
+		Document options = (Document) collectionInfo.get("options");
+		Document timeseries = (Document) options.get("timeseries");
+		String timeField = timeseries.getString("timeField");
 
-                // Check if we've reached batch size
-                if (count >= config.getBatchSize()) {
-                    // Look ahead to see if next document has same timeField value
-                    if (cursor.hasNext()) {
-                        Document nextDoc = cursor.next();
-                        Object nextTimeValue = nextDoc.get(timeField);
+		// Sort by timeField
+		Document sort = new Document(timeField, 1);
+		Object lastTimeValue = null;
+		boolean isFirstBatch = true;
+		Document savedLookaheadDoc = null;
+		boolean includeSchema = true; // Include schema in first request
 
-                        // If next document has same timeField, include it and continue
-                        if (nextTimeValue.equals(currentTimeValue)) {
-                            batch.add(nextDoc);
-                            count++;
+		while (true) {
+			// Build query - for subsequent batches, filter by timeField > lastTimeValue
+			FindIterable<Document> docs;
+			if (isFirstBatch) {
+				docs = collection.find().sort(sort);
+				isFirstBatch = false;
+			} else {
+				Document query = new Document(timeField, new Document("$gt", lastTimeValue));
+				docs = collection.find(query).sort(sort);
+			}
 
-                            // Continue looking ahead until timeField changes
-                            while (cursor.hasNext()) {
-                                Document anotherDoc = cursor.next();
-                                Object anotherTimeValue = anotherDoc.get(timeField);
+			// Process batch
+			List<Document> batch = new ArrayList<>(config.getBatchSize());
 
-                                if (anotherTimeValue.equals(currentTimeValue)) {
-                                    batch.add(anotherDoc);
-                                    count++;
-                                } else {
-                                    // Save document with different timeField for next batch
-                                    savedLookaheadDoc = anotherDoc;
-                                    batchComplete = true;
-                                    break;
-                                }
-                            }
-                        } else {
-                            // Next document has different timeField, save it for next batch
-                            savedLookaheadDoc = nextDoc;
-                            batchComplete = true;
-                        }
-                    } else {
-                        batchComplete = true;
-                    }
-                }
+			// Add saved lookahead document from previous iteration if it exists
+			if (savedLookaheadDoc != null) {
+				batch.add(savedLookaheadDoc);
+				savedLookaheadDoc = null;
+			}
 
-                // Remember the last time value for the next query
-                lastTimeValue = currentTimeValue;
-            }
+			MongoCursor<Document> cursor = docs.iterator();
 
-            // If we got no new documents (and no saved document), we're done
-            if (batch.isEmpty()) {
-                break;
-            }
+			Object currentTimeValue = null;
+			boolean batchComplete = false;
+			int count = batch.size(); // Start with the count of any previously saved documents
 
-            // Send batch to BigQuery
-            logger.info(
-                    "Sending batch of {} documents from {}.{} (timeseries collection) with timeField range: {} to {}",
-                    batch.size(), dbName, collectionName, batch.get(0).get(timeField),
-                    batch.get(batch.size() - 1).get(timeField));
-            try {
-                convertAndSendBatch(batch, streamName, bidiStream, tableName, includeSchema);
-                includeSchema = false;  // Only include schema in first batch
-            } catch (IOException e) {
-                logger.error("Error sending batch", e);
-            }
+			while (cursor.hasNext() && !batchComplete) {
+				Document doc = cursor.next();
+				currentTimeValue = doc.get(timeField);
 
-            // If cursor has no more documents and no lookahead saved, we're done
-            if (!cursor.hasNext() && savedLookaheadDoc == null) {
-                break;
-            }
-        }
-    }
+				// Add document to batch
+				batch.add(doc);
+				count++;
+
+				// Check if we've reached batch size
+				if (count >= config.getBatchSize()) {
+					// Look ahead to see if next document has same timeField value
+					if (cursor.hasNext()) {
+						Document nextDoc = cursor.next();
+						Object nextTimeValue = nextDoc.get(timeField);
+
+						// If next document has same timeField, include it and continue
+						if (nextTimeValue.equals(currentTimeValue)) {
+							batch.add(nextDoc);
+							count++;
+
+							// Continue looking ahead until timeField changes
+							while (cursor.hasNext()) {
+								Document anotherDoc = cursor.next();
+								Object anotherTimeValue = anotherDoc.get(timeField);
+
+								if (anotherTimeValue.equals(currentTimeValue)) {
+									batch.add(anotherDoc);
+									count++;
+								} else {
+									// Save document with different timeField for next batch
+									savedLookaheadDoc = anotherDoc;
+									batchComplete = true;
+									break;
+								}
+							}
+						} else {
+							// Next document has different timeField, save it for next batch
+							savedLookaheadDoc = nextDoc;
+							batchComplete = true;
+						}
+					} else {
+						batchComplete = true;
+					}
+				}
+
+				// Remember the last time value for the next query
+				lastTimeValue = currentTimeValue;
+			}
+
+			// If we got no new documents (and no saved document), we're done
+			if (batch.isEmpty()) {
+				break;
+			}
+
+			// Send batch to BigQuery
+			logger.info(
+					"Sending batch of {} documents from {}.{} (timeseries collection) with timeField range: {} to {}",
+					batch.size(), dbName, collectionName, batch.get(0).get(timeField),
+					batch.get(batch.size() - 1).get(timeField));
+			try {
+				convertAndSendBatch(batch, streamName, tableName, includeSchema);
+				includeSchema = false; // Only include schema in first batch
+			} catch (IOException e) {
+				logger.error("Error sending batch", e);
+			}
+
+			// If cursor has no more documents and no lookahead saved, we're done
+			if (!cursor.hasNext() && savedLookaheadDoc == null) {
+				break;
+			}
+		}
+	}
 }

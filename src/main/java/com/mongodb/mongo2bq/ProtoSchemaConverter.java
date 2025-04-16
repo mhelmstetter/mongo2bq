@@ -77,13 +77,30 @@ public class ProtoSchemaConverter {
 	    // Analyze fields from sample documents
 	    for (Document doc : sampleDocs) {
 	        for (String key : doc.keySet()) {
+	            // IMPORTANT: Don't convert to lowercase here - preserve original case
 	            String validFieldName = makeValidProtoFieldName(key);
 	            
 	            // If field exists in BigQuery, use its type
-	            if (bigQueryFields != null && bigQueryFields.containsKey(validFieldName.toLowerCase())) {
-	                LegacySQLTypeName bqType = bigQueryFields.get(validFieldName.toLowerCase());
-	                Type protoType = BigQueryHelper.convertBigQueryTypeToProtoType(bqType);
-	                fieldTypes.put(key, protoType);
+	            if (bigQueryFields != null) {
+	                // Use case-insensitive lookup for type
+	                LegacySQLTypeName bqType = null;
+	                for (Map.Entry<String, LegacySQLTypeName> entry : bigQueryFields.entrySet()) {
+	                    if (entry.getKey().equalsIgnoreCase(validFieldName)) {
+	                        bqType = entry.getValue();
+	                        break;
+	                    }
+	                }
+	                
+	                if (bqType != null) {
+	                    Type protoType = BigQueryHelper.convertBigQueryTypeToProtoType(bqType);
+	                    // Use the original case for the field name
+	                    fieldTypes.put(key, protoType);
+	                } else {
+	                    // For new fields, infer type from MongoDB value
+	                    Object value = doc.get(key);
+	                    Type protoType = inferProtoType(value);
+	                    fieldTypes.put(key, protoType);
+	                }
 	            } else {
 	                // For new fields, infer type from MongoDB value
 	                Object value = doc.get(key);
@@ -106,14 +123,14 @@ public class ProtoSchemaConverter {
 
 	        int fieldNumber = 1;
 	        for (Map.Entry<String, Type> entry : fieldTypes.entrySet()) {
+	            // CRITICAL: Use original key with proper casing
+	            String originalKey = entry.getKey();
+	            String validFieldName = makeValidProtoFieldName(originalKey);
+	            
 	            FieldDescriptorProto.Builder fieldBuilder = FieldDescriptorProto.newBuilder()
-	                    .setName(entry.getKey())
+	                    .setName(validFieldName)  // Use the properly cased field name
 	                    .setNumber(fieldNumber++)
 	                    .setType(entry.getValue());
-	            
-	            // Ensure field name is valid for protobuf
-	            String validFieldName = makeValidProtoFieldName(entry.getKey());
-	            fieldBuilder.setName(validFieldName);
 	            
 	            messageBuilder.addField(fieldBuilder.build());
 	        }

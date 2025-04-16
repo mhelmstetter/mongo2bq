@@ -148,19 +148,22 @@ public class ProtoSchemaConverter {
 	 * Make field names protobuf-compatible
 	 */
 	private static String makeValidProtoFieldName(String name) {
-		// Replace any invalid character with underscore
-		String validName = name.replaceAll("[^a-zA-Z0-9_]", "_");
+	    // Replace any invalid character with underscore
+	    String validName = name.replaceAll("[^a-zA-Z0-9_]", "_");
 
-		if (!validName.equals(name)) {
-			logger.debug("Field name {} is not a valid protobuf field name, had to remap to {}", name, validName);
-		}
+	    // IMPORTANT: Make all field names lowercase to ensure consistency
+	    validName = validName.toLowerCase();
 
-		// Ensure it starts with a letter or underscore
-		if (!validName.isEmpty() && !Character.isLetter(validName.charAt(0)) && validName.charAt(0) != '_') {
-			validName = "_" + validName;
-		}
+	    // Ensure it starts with a letter or underscore
+	    if (!validName.isEmpty() && !Character.isLetter(validName.charAt(0)) && validName.charAt(0) != '_') {
+	        validName = "_" + validName;
+	    }
 
-		return validName;
+	    if (!validName.equals(name.toLowerCase())) {
+	        logger.debug("Field name {} is not a valid protobuf field name, had to remap to {}", name, validName);
+	    }
+
+	    return validName;
 	}
 
 	/**
@@ -194,7 +197,7 @@ public class ProtoSchemaConverter {
 	 * Convert MongoDB documents to Protobuf rows
 	 */
 	public ProtoRows convertDocumentsToProtoRows(List<Document> documents, String tableName) {
-// Get cached schema
+		// Get cached schema
 		CachedProtoSchema cachedSchema = schemaCache.get(tableName);
 		if (cachedSchema == null) {
 			throw new IllegalStateException("Schema not generated for " + tableName);
@@ -203,7 +206,7 @@ public class ProtoSchemaConverter {
 		Set<String> knownBQFields = BigQueryHelper.getBigQueryFields(config.getGcpProjectId(), config.getBqDatasetName(), tableName);
 		Set<String> newFieldsThisBatch = new HashSet<>();
 
-// First pass: identify new fields that need to be added to BigQuery
+		// First pass: identify new fields that need to be added to BigQuery
 		for (Document doc : documents) {
 			for (String key : doc.keySet()) {
 				String validFieldName = makeValidProtoFieldName(key);
@@ -213,17 +216,17 @@ public class ProtoSchemaConverter {
 			}
 		}
 
-// If we have new fields, update the BigQuery schema
+		// If we have new fields, update the BigQuery schema
 		if (!newFieldsThisBatch.isEmpty()) {
 			logger.info("Found new fields to add to BigQuery schema: {}", newFieldsThisBatch);
 			boolean success = updateBigQuerySchema(config.getGcpProjectId(), config.getBqDatasetName(), tableName, newFieldsThisBatch, documents);
 			if (!success) {
 				logger.error("Failed to update BigQuery schema with new fields: {}", newFieldsThisBatch);
-// You may want to decide how to handle this - continue with existing fields or abort
+				// You may want to decide how to handle this - continue with existing fields or abort
 			}
 		}
 
-// Now continue with normal processing
+		// Now continue with normal processing
 		ProtoRows.Builder protoRowsBuilder = ProtoRows.newBuilder();
 		int successfulConversions = 0;
 

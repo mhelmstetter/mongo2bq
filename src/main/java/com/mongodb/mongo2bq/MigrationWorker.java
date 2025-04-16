@@ -6,13 +6,11 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.logging.Logger;
 
 import org.apache.commons.lang3.time.StopWatch;
 import org.bson.Document;
 import org.slf4j.LoggerFactory;
 
-import com.google.api.core.ApiFuture;
 import com.google.api.gax.rpc.BidiStream;
 import com.google.cloud.bigquery.TableId;
 import com.google.cloud.bigquery.storage.v1.AppendRowsRequest;
@@ -50,9 +48,6 @@ public class MigrationWorker implements Runnable {
     private final AtomicLong rowsWritten = new AtomicLong(0);
     private final AtomicLong bytesWritten = new AtomicLong(0);
     private final StopWatch streamStopWatch = new StopWatch();
-    
-    // Flag to indicate when schema should be included with the next batch
-    private boolean includeSchemaInNextBatch = true;
 
 	public MigrationWorker(MongoToBigQueryConfig config, String mongoClientName, Namespace ns,
 			Document collectionInfo) {
@@ -130,17 +125,14 @@ public class MigrationWorker implements Runnable {
 	        currentStreamName = currentStream.getName();
 	        logger.info("Created new stream: {}", currentStreamName);
 	        
-	        // Create a new BidiStream for this write stream
-	        currentBidiStream = client.appendRowsCallable().call();
+	        // Remove this line:
+	        // currentBidiStream = client.appendRowsCallable().call();
 	        
 	        // Reset counters
 	        rowsWritten.set(0);
 	        bytesWritten.set(0);
 	        streamStopWatch.reset();
 	        streamStopWatch.start();
-	        
-	        // Reset schema inclusion flag
-	        includeSchemaInNextBatch = true;
 	    } catch (Exception e) {
 	        logger.error("Failed to create new write stream", e);
 	        throw new RuntimeException("Failed to create new write stream", e);
@@ -165,9 +157,10 @@ public class MigrationWorker implements Runnable {
      * Finalize the current stream and create a new one
      */
     private void rotateStreamIfNeeded(BigQueryWriteClient client, String parentTable) {
-        if (shouldRotateStream() != null) {
-            logger.info("Rotating stream. Stats: rows={}, bytes={}, elapsed={} ms",
-                        rowsWritten.get(), bytesWritten.get(), streamStopWatch.getTime());
+        String rotateReason = shouldRotateStream();
+        if (rotateReason != null) {
+            logger.info("Rotating stream due to {}: rows={}, bytes={}, elapsed={} ms",
+                        rotateReason, rowsWritten.get(), bytesWritten.get(), streamStopWatch.getTime());
             
             // Finalize current stream
             finalizeAndCommitStream(client, currentStreamName, parentTable);
@@ -182,16 +175,7 @@ public class MigrationWorker implements Runnable {
      */
     private void finalizeAndCommitStream(BigQueryWriteClient client, String streamName, String parentTable) {
         try {
-            // Close the BidiStream if it exists
-            if (currentBidiStream != null) {
-                try {
-                    currentBidiStream.closeSend();
-                } catch (Exception e) {
-                    logger.warn("Error closing BidiStream: {}", e.getMessage());
-                }
-                currentBidiStream = null;
-            }
-        
+        	
             logger.info("Finalizing stream: {}", streamName);
             
             // Send finalize request
@@ -264,11 +248,7 @@ public class MigrationWorker implements Runnable {
 			// Send batch to BigQuery
 			logger.info("Sending batch of {} documents from {}.{} (regular collection)", batch.size(), dbName, collectionName);
 			try {
-				// Use the class-level flag for schema inclusion
-				convertAndSendBatch(batch, streamName, tableName, includeSchemaInNextBatch);
-				
-				// Reset the flag after sending
-				includeSchemaInNextBatch = false;
+				convertAndSendBatch(batch, streamName, tableName);
                 
                 // Check if we need to rotate the stream
                 rotateStreamIfNeeded(client, parentTable);
@@ -286,14 +266,14 @@ public class MigrationWorker implements Runnable {
 		}
 	}
 
-	private void convertAndSendBatch(List<Document> batch, String streamName, String tableName, boolean includeSchema)
+	private void convertAndSendBatch(List<Document> batch, String streamName, String tableName)
 	        throws IOException {
 	    
 	    // Get allowed fields from BigQuery table
 	    Set<String> allowedFields = BigQueryHelper.fetchBigQueryTableFields(config.getGcpProjectId(), config.getBqDatasetName(), tableName);
-
-	    AppendRowsRequest request = converter.createAppendRequest(streamName, batch, tableName,
-	            includeSchema, allowedFields);
+	    
+	    // Now we always include schema
+	    AppendRowsRequest request = converter.createAppendRequest(streamName, batch, tableName, true, allowedFields);
 	            
 	    if (request == null) {
 	        logger.warn("No rows to append after conversion");
@@ -332,6 +312,12 @@ public class MigrationWorker implements Runnable {
 	        } else {
 	            logger.warn("Received empty or incomplete response");
 	        }
+	    } catch (IOException e) {
+	        logger.error("IOException while sending batch", e);
+	        throw e;
+	    } catch (Exception e) {
+	        logger.error("Error while sending batch", e);
+	        throw new IOException("Error sending batch: " + e.getMessage(), e);
 	    } finally {
 	        // Always close the BidiStream when done
 	        try {
@@ -442,11 +428,7 @@ public class MigrationWorker implements Runnable {
 					batch.size(), dbName, collectionName, batch.get(0).get(timeField),
 					batch.get(batch.size() - 1).get(timeField));
 			try {
-				// Use the class-level flag for schema inclusion
-				convertAndSendBatch(batch, streamName, tableName, includeSchemaInNextBatch);
-				
-				// Reset the flag after sending
-				includeSchemaInNextBatch = false;
+				convertAndSendBatch(batch, streamName, tableName);
                 
                 // Check if we need to rotate the stream
                 rotateStreamIfNeeded(client, parentTable);

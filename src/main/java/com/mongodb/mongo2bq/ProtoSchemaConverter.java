@@ -419,36 +419,38 @@ public class ProtoSchemaConverter {
 	 * Create an AppendRowsRequest with the appropriate schema and rows
 	 */
 	public AppendRowsRequest createAppendRequest(String streamName, List<Document> batch, String tableName,
-			boolean includeSchema, Set<String> allowedFields) {
-		ProtoSchema protoSchema = null;
+	        boolean includeSchema, Set<String> allowedFields) {
+	    
+	    // Always generate schema
+	    ProtoSchema protoSchema = null;
+	    
+	    // Generate schema if needed or not in cache
+	    if (!schemaCache.containsKey(tableName)) {
+	        logger.info("Generating new schema for table {}", tableName);
+	        protoSchema = generateProtoSchema(batch, tableName);
+	    } else {
+	        logger.info("Using cached schema for table {}", tableName);
+	        protoSchema = schemaCache.get(tableName).protoSchema;
+	    }
 
-		// Generate schema if needed
-		if (!schemaCache.containsKey(tableName)) {
-			logger.info("Generating new schema for table {}", tableName);
-			protoSchema = generateProtoSchema(batch, tableName);
-		} else if (includeSchema) {
-			logger.info("Using cached schema for table {}", tableName);
-			protoSchema = schemaCache.get(tableName).protoSchema;
-		}
+	    // Convert documents to proto rows
+	    ProtoRows rows = convertDocumentsToProtoRows(batch, tableName);
 
-		//public static ProtoRows convertDocumentsToProtoRows(List<Document> documents, String tableName, String projectId, String datasetId, String tableId) {
-		// Convert documents to proto rows
-		ProtoRows rows = convertDocumentsToProtoRows(batch, tableName);
+	    // Validate rows
+	    if (rows.getSerializedRowsCount() == 0) {
+	        logger.warn("No rows were converted from batch of {} documents!", batch.size());
+	        return null; // Return null to indicate no data to send
+	    }
 
-		// Validate rows
-		if (rows.getSerializedRowsCount() == 0) {
-			logger.warn("No rows were converted from batch of {} documents!", batch.size());
-			return null; // Return null to indicate no data to send
-		}
+	    // Build the request - ALWAYS include the schema
+	    ProtoData.Builder dataBuilder = ProtoData.newBuilder().setRows(rows);
+	    
+	    // Always include the schema
+	    dataBuilder.setWriterSchema(protoSchema);
+	    logger.debug("Including schema in append request for stream {}", streamName);
 
-		// Build the request
-		ProtoData.Builder dataBuilder = ProtoData.newBuilder().setRows(rows);
-		if (protoSchema != null) {
-			dataBuilder.setWriterSchema(protoSchema);
-		}
+	    logger.debug("Created append request with {} rows for stream {}", rows.getSerializedRowsCount(), streamName);
 
-		logger.debug("Created append request with {} rows for stream {}", rows.getSerializedRowsCount(), streamName);
-
-		return AppendRowsRequest.newBuilder().setWriteStream(streamName).setProtoRows(dataBuilder.build()).build();
+	    return AppendRowsRequest.newBuilder().setWriteStream(streamName).setProtoRows(dataBuilder.build()).build();
 	}
 }

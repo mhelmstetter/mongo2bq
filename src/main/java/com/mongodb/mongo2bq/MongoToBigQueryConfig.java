@@ -90,7 +90,7 @@ public class MongoToBigQueryConfig {
 		bqDatasetName = config.getString(DATASET_NAME);
 		sourceMongoUris = config.getStringArray(SOURCE_MONGO_URIS);
 		batchSize = config.getInt(BATCH_SIZE, 10000);
-		serviceAccountKeyPath = config.getString(SERVICE_ACCOUNT_KEY_PATH);
+		serviceAccountKeyPath = config.getString(SERVICE_ACCOUNT_KEY_PATH, null);
 		
 		maxRowsPerStream = config.getLong(MAX_ROWS_PER_STREAM, DEFAULT_ROWS_PER_STREAM);
 		maxStreamDurationMinutes = config.getLong(MAX_STREAM_DURATION_MINUTES, DEFAULT_STREAM_DURATION_MINUTES);

@@ -12,6 +12,10 @@ import org.bson.Document;
 import org.slf4j.LoggerFactory;
 
 import com.google.api.gax.rpc.BidiStream;
+import com.google.api.gax.rpc.NotFoundException;
+import com.google.cloud.bigquery.BigQuery;
+import com.google.cloud.bigquery.BigQueryOptions;
+import com.google.cloud.bigquery.Schema;
 import com.google.cloud.bigquery.Table;
 import com.google.cloud.bigquery.TableId;
 import com.google.cloud.bigquery.storage.v1.AppendRowsRequest;
@@ -61,24 +65,67 @@ public class MigrationWorker implements Runnable {
 
 	@Override
 	public void run() {
-		TableId tableId = TableId.of(config.getBqDatasetName(), ns.getDatabaseName() + "_" + ns.getCollectionName());
-		MongoDatabase db = mongoClient.getDatabase(ns.getDatabaseName());
+	    TableId tableId = TableId.of(config.getBqDatasetName(), ns.getDatabaseName() + "_" + ns.getCollectionName());
+	    MongoDatabase db = mongoClient.getDatabase(ns.getDatabaseName());
 
-		if (!BigQueryHelper.tableExists(config.getBigQuery(), tableId)) {
-		    BigQueryHelper.createBigQueryTable(config.getBigQuery(), db.getCollection(ns.getCollectionName()), tableId);
-		    
-		    // Add a pause to allow BigQuery to fully register the new table
-		    try {
-		        logger.info("Waiting for new table to be fully available...");
-		        Thread.sleep(5000);  // 5 second delay
-		    } catch (InterruptedException e) {
-		        Thread.currentThread().interrupt();
-		    }
-		} else {
-		    logger.debug("BigQuery table already exists", tableId);
-		}
-		processCollection(config.getBigQueryClient(), db.getCollection(ns.getCollectionName()), ns.getDatabaseName(),
-				collectionInfo);
+	    if (!BigQueryHelper.tableExists(config.getBigQuery(), tableId)) {
+	        BigQueryHelper.createBigQueryTable(config.getBigQuery(), db.getCollection(ns.getCollectionName()), tableId);
+	        
+	        // Add this block after table creation
+	        logger.info("Waiting for new table to be fully available...");
+	        String fullyQualifiedTableId = String.format("%s.%s.%s", 
+	                config.getGcpProjectId(), config.getBqDatasetName(), tableId.getTable());
+	        
+	        boolean tableReady = false;
+	        int retryCount = 0;
+	        int maxRetries = 10;
+	        long retryDelayMs = 5000; // 5 seconds
+	        
+	        while (!tableReady && retryCount < maxRetries) {
+	            logger.info("Verifying table exists: {}", fullyQualifiedTableId);
+	            tableReady = isTableFullyAvailable(config.getGcpProjectId(), 
+	                                             config.getBqDatasetName(), 
+	                                             tableId.getTable());
+	            if (!tableReady) {
+	                retryCount++;
+	                if (retryCount < maxRetries) {
+	                    try {
+	                        Thread.sleep(retryDelayMs);
+	                    } catch (InterruptedException e) {
+	                        Thread.currentThread().interrupt();
+	                        throw new RuntimeException("Interrupted while waiting for table to be available", e);
+	                    }
+	                } else {
+	                    logger.error("Table not available after {} attempts", maxRetries);
+	                    return; // Exit the run method
+	                }
+	            }
+	        }
+	    } else {
+	        logger.debug("BigQuery table already exists: {}", tableId);
+	    }
+	    
+	    // Only proceed to process the collection if we have a table
+	    processCollection(config.getBigQueryClient(), db.getCollection(ns.getCollectionName()), 
+	                    ns.getDatabaseName(), collectionInfo);
+	}
+	
+	private boolean isTableFullyAvailable(String projectId, String datasetId, String tableId) {
+	    try {
+	        BigQuery bigQuery = BigQueryOptions.getDefaultInstance().getService();
+	        Table table = bigQuery.getTable(TableId.of(projectId, datasetId, tableId));
+	        
+	        if (table == null) {
+	            return false;
+	        }
+	        
+	        // Try to get schema - this will fail if table is not ready
+	        Schema schema = table.getDefinition().getSchema();
+	        return schema != null;
+	    } catch (Exception e) {
+	        logger.warn("Error checking table availability: {}", e.getMessage());
+	        return false;
+	    }
 	}
 
 	private void processCollection(BigQueryWriteClient client, MongoCollection<Document> collection, String dbName,
@@ -119,53 +166,49 @@ public class MigrationWorker implements Runnable {
      * Initialize a new write stream
      */
 	private void initializeStream(BigQueryWriteClient client, String parentTable) {
-	    try {
-	        // Verify the table exists before attempting to create a stream
-	        String[] parts = parentTable.split("/");
-	        String projectId = parts[1];
-	        String datasetId = parts[3];
-	        String tableId = parts[5];
-	        
-	        logger.info("Verifying table exists: {}.{}.{}", projectId, datasetId, tableId);
-	        TableId tableIdObj = TableId.of(projectId, datasetId, tableId);
-	        
-	        // Check if the table exists
-	        Table table = config.getBigQuery().getTable(tableIdObj);
-	        if (table == null) {
-	            logger.error("Table does not exist: {}.{}.{}", projectId, datasetId, tableId);
-	            throw new IllegalStateException("Table does not exist: " + tableId);
-	        }
-	        
-	        // Add a small delay to ensure table is fully available
+	    int maxRetries = 5;
+	    int retryDelayMs = 1000;
+	    
+	    for (int attempt = 1; attempt <= maxRetries; attempt++) {
 	        try {
-	            Thread.sleep(2000); // 2 second delay
-	        } catch (InterruptedException e) {
-	            Thread.currentThread().interrupt();
+	            // Create a write stream for the specified table
+	            WriteStream stream = WriteStream.newBuilder()
+	                .setType(WriteStream.Type.PENDING)
+	                .build();
+	            
+	            CreateWriteStreamRequest createRequest = CreateWriteStreamRequest.newBuilder()
+	                .setParent(parentTable)
+	                .setWriteStream(stream)
+	                .build();
+	            
+	            currentStream = client.createWriteStream(createRequest);
+	            currentStreamName = currentStream.getName();
+	            logger.info("Created new stream: {}", currentStreamName);
+	            
+	            // Reset counters
+	            rowsWritten.set(0);
+	            bytesWritten.set(0);
+	            streamStopWatch.reset();
+	            streamStopWatch.start();
+	            
+	            return; // Success - exit method
+	            
+	        } catch (NotFoundException e) {
+	            logger.warn("Table not found on attempt {}/{}. Retrying in {} ms", 
+	                      attempt, maxRetries, retryDelayMs);
+	            
+	            if (attempt == maxRetries) {
+	                throw new RuntimeException("Failed to create write stream after " + maxRetries + " attempts", e);
+	            }
+	            
+	            try {
+	                Thread.sleep(retryDelayMs);
+	                retryDelayMs *= 2; // Exponential backoff
+	            } catch (InterruptedException ie) {
+	                Thread.currentThread().interrupt();
+	                throw new RuntimeException("Interrupted during retry", ie);
+	            }
 	        }
-	        
-	        // Create a write stream for the specified table
-	        WriteStream stream = WriteStream.newBuilder()
-	            .setType(WriteStream.Type.PENDING)
-	            .build();
-	        
-	        CreateWriteStreamRequest createRequest = CreateWriteStreamRequest.newBuilder()
-	            .setParent(parentTable)
-	            .setWriteStream(stream)
-	            .build();
-	        
-	        currentStream = client.createWriteStream(createRequest);
-	        currentStreamName = currentStream.getName();
-	        logger.info("Created new stream: {}", currentStreamName);
-	        
-	        // Reset counters
-	        rowsWritten.set(0);
-	        bytesWritten.set(0);
-	        streamStopWatch.reset();
-	        streamStopWatch.start();
-	        
-	    } catch (Exception e) {
-	        logger.error("Failed to create new write stream", e);
-	        throw new RuntimeException("Failed to create new write stream", e);
 	    }
 	}
     

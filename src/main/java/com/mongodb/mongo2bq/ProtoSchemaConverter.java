@@ -151,15 +151,12 @@ public class ProtoSchemaConverter {
 	    // Replace any invalid character with underscore
 	    String validName = name.replaceAll("[^a-zA-Z0-9_]", "_");
 
-	    // IMPORTANT: Make all field names lowercase to ensure consistency
-	    validName = validName.toLowerCase();
-
 	    // Ensure it starts with a letter or underscore
 	    if (!validName.isEmpty() && !Character.isLetter(validName.charAt(0)) && validName.charAt(0) != '_') {
 	        validName = "_" + validName;
 	    }
 
-	    if (!validName.equals(name.toLowerCase())) {
+	    if (!validName.equals(name)) {
 	        logger.debug("Field name {} is not a valid protobuf field name, had to remap to {}", name, validName);
 	    }
 
@@ -208,12 +205,22 @@ public class ProtoSchemaConverter {
 
 		// First pass: identify new fields that need to be added to BigQuery
 		for (Document doc : documents) {
-			for (String key : doc.keySet()) {
-				String validFieldName = makeValidProtoFieldName(key);
-				if (knownBQFields != null && !knownBQFields.contains(validFieldName.toLowerCase())) {
-					newFieldsThisBatch.add(key);
-				}
-			}
+		    for (String key : doc.keySet()) {
+		        String validFieldName = makeValidProtoFieldName(key);
+		        // Case-insensitive comparison for existence check
+		        boolean fieldExists = false;
+		        if (knownBQFields != null) {
+		            for (String knownField : knownBQFields) {
+		                if (knownField.equalsIgnoreCase(validFieldName)) {
+		                    fieldExists = true;
+		                    break;
+		                }
+		            }
+		        }
+		        if (!fieldExists) {
+		            newFieldsThisBatch.add(key);
+		        }
+		    }
 		}
 
 		// If we have new fields, update the BigQuery schema

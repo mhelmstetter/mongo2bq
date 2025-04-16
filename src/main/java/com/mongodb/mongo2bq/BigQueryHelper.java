@@ -131,7 +131,8 @@ public class BigQueryHelper {
             
             Set<String> fieldNames = new HashSet<>();
             for (Field field : table.getDefinition().getSchema().getFields()) {
-                fieldNames.add(field.getName().toLowerCase());
+                // Keep original case but still use case-insensitive comparisons elsewhere
+                fieldNames.add(field.getName());
             }
             
             return fieldNames;

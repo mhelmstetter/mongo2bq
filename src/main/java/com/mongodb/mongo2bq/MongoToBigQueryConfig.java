@@ -37,6 +37,15 @@ public class MongoToBigQueryConfig {
 	private static final String SOURCE_MONGO_URIS = "sourceMongoUris";
 	private static final String SOURCE_MONGO_NAMES = "sourceMongoNames";
 	private static final String BATCH_SIZE = "batchSize";
+	
+	private static final String MAX_ROWS_PER_STREAM = "maxRowsPerStream";
+	private static final String MAX_STREAM_DURATION_MINUTES = "maxStreamDurationMinutes";
+	private static final String MAX_MEGABYTES_PER_STREAM = "maxMegabytesPerStream";
+	
+    // Constants that control when to finalize streams
+    private static final long DEFAULT_ROWS_PER_STREAM = 1_000_000; // 1 million rows
+    private static final long DEFAULT_STREAM_DURATION_MINUTES = 30; // 30 minutes
+    private static final long DEFAULT_MEGABYTES_PER_STREAM = 4096; // 4 GB
     
     protected Set<Namespace> includeNamespaces = new HashSet<Namespace>();
 	protected Set<String> includedNamespaceStrings = new HashSet<String>();
@@ -51,6 +60,10 @@ public class MongoToBigQueryConfig {
 	private String[] sourceMongoUris;
 	private String[] sourceMongoNames;
     private int batchSize;
+    
+    private long maxRowsPerStream;
+    private long maxStreamDurationMinutes;
+    private long maxMegabytesPerStream;
     
     Map<String, MongoClient> mongoClients = new LinkedHashMap<>();
     
@@ -74,6 +87,10 @@ public class MongoToBigQueryConfig {
 		bqDatasetName = config.getString(DATASET_NAME);
 		sourceMongoUris = config.getStringArray(SOURCE_MONGO_URIS);
 		batchSize = config.getInt(BATCH_SIZE, 10000);
+		
+		maxRowsPerStream = config.getLong(MAX_ROWS_PER_STREAM, DEFAULT_ROWS_PER_STREAM);
+		maxStreamDurationMinutes = config.getLong(MAX_STREAM_DURATION_MINUTES, DEFAULT_STREAM_DURATION_MINUTES);
+		maxMegabytesPerStream = config.getLong(MAX_MEGABYTES_PER_STREAM, DEFAULT_MEGABYTES_PER_STREAM);
 		
 		if (sourceMongoUris.length == 0) {
 			throw new IllegalArgumentException(SOURCE_MONGO_URIS + " not defined in properties");
@@ -244,6 +261,18 @@ public class MongoToBigQueryConfig {
 
 	public BigQuery getBigQuery() {
 		return bigQuery;
+	}
+
+	public long getMaxRowsPerStream() {
+		return maxRowsPerStream;
+	}
+
+	public long getMaxStreamDurationMinutes() {
+		return maxStreamDurationMinutes;
+	}
+
+	public long getMaxMegabytesPerStream() {
+		return maxMegabytesPerStream;
 	}
     
     

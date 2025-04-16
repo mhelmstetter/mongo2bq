@@ -12,6 +12,7 @@ import org.bson.Document;
 import org.slf4j.LoggerFactory;
 
 import com.google.api.gax.rpc.BidiStream;
+import com.google.cloud.bigquery.Table;
 import com.google.cloud.bigquery.TableId;
 import com.google.cloud.bigquery.storage.v1.AppendRowsRequest;
 import com.google.cloud.bigquery.storage.v1.AppendRowsResponse;
@@ -64,9 +65,17 @@ public class MigrationWorker implements Runnable {
 		MongoDatabase db = mongoClient.getDatabase(ns.getDatabaseName());
 
 		if (!BigQueryHelper.tableExists(config.getBigQuery(), tableId)) {
-			BigQueryHelper.createBigQueryTable(config.getBigQuery(), db.getCollection(ns.getCollectionName()), tableId);
+		    BigQueryHelper.createBigQueryTable(config.getBigQuery(), db.getCollection(ns.getCollectionName()), tableId);
+		    
+		    // Add a pause to allow BigQuery to fully register the new table
+		    try {
+		        logger.info("Waiting for new table to be fully available...");
+		        Thread.sleep(5000);  // 5 second delay
+		    } catch (InterruptedException e) {
+		        Thread.currentThread().interrupt();
+		    }
 		} else {
-			logger.debug("BigQuery table already exists", tableId);
+		    logger.debug("BigQuery table already exists", tableId);
 		}
 		processCollection(config.getBigQueryClient(), db.getCollection(ns.getCollectionName()), ns.getDatabaseName(),
 				collectionInfo);
@@ -111,6 +120,29 @@ public class MigrationWorker implements Runnable {
      */
 	private void initializeStream(BigQueryWriteClient client, String parentTable) {
 	    try {
+	        // Verify the table exists before attempting to create a stream
+	        String[] parts = parentTable.split("/");
+	        String projectId = parts[1];
+	        String datasetId = parts[3];
+	        String tableId = parts[5];
+	        
+	        logger.info("Verifying table exists: {}.{}.{}", projectId, datasetId, tableId);
+	        TableId tableIdObj = TableId.of(projectId, datasetId, tableId);
+	        
+	        // Check if the table exists
+	        Table table = config.getBigQuery().getTable(tableIdObj);
+	        if (table == null) {
+	            logger.error("Table does not exist: {}.{}.{}", projectId, datasetId, tableId);
+	            throw new IllegalStateException("Table does not exist: " + tableId);
+	        }
+	        
+	        // Add a small delay to ensure table is fully available
+	        try {
+	            Thread.sleep(2000); // 2 second delay
+	        } catch (InterruptedException e) {
+	            Thread.currentThread().interrupt();
+	        }
+	        
 	        // Create a write stream for the specified table
 	        WriteStream stream = WriteStream.newBuilder()
 	            .setType(WriteStream.Type.PENDING)
@@ -125,14 +157,12 @@ public class MigrationWorker implements Runnable {
 	        currentStreamName = currentStream.getName();
 	        logger.info("Created new stream: {}", currentStreamName);
 	        
-	        // Remove this line:
-	        // currentBidiStream = client.appendRowsCallable().call();
-	        
 	        // Reset counters
 	        rowsWritten.set(0);
 	        bytesWritten.set(0);
 	        streamStopWatch.reset();
 	        streamStopWatch.start();
+	        
 	    } catch (Exception e) {
 	        logger.error("Failed to create new write stream", e);
 	        throw new RuntimeException("Failed to create new write stream", e);

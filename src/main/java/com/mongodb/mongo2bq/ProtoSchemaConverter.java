@@ -368,51 +368,54 @@ public class ProtoSchemaConverter {
 	 * Set a field value in the Protobuf message builder
 	 */
 	private static boolean setFieldValue(DynamicMessage.Builder builder, FieldDescriptor field, Object value) {
-		if (value == null) {
-			return false; // Skip null values
-		}
+	    if (value == null) {
+	        return false; // Skip null values
+	    }
 
-		try {
-			switch (field.getType()) {
-			case INT32:
-				if (value instanceof Number) {
-					builder.setField(field, ((Number) value).intValue());
-					return true;
-				}
-				break;
-			case INT64:
-				if (value instanceof Number) {
-					builder.setField(field, ((Number) value).longValue());
-					return true;
-				} else if (value instanceof Date) {
-					builder.setField(field, ((Date) value).getTime());
-					return true;
-				}
-				break;
-			case DOUBLE:
-				if (value instanceof Number) {
-					builder.setField(field, ((Number) value).doubleValue());
-					return true;
-				}
-				break;
-			case BOOL:
-				if (value instanceof Boolean) {
-					builder.setField(field, value);
-					return true;
-				}
-				break;
-			case STRING:
-				builder.setField(field, value.toString());
-				return true;
-			default:
-				// For other types, convert to string
-				builder.setField(field, value.toString());
-				return true;
-			}
-		} catch (Exception e) {
-			logger.warn("Could not set field '{}' with value '{}': {}", field.getName(), value, e.getMessage());
-		}
-		return false;
+	    try {
+	        switch (field.getType()) {
+	        case INT32:
+	            if (value instanceof Number) {
+	                builder.setField(field, ((Number) value).intValue());
+	                return true;
+	            }
+	            break;
+	        case INT64:
+	            if (value instanceof Number) {
+	                builder.setField(field, ((Number) value).longValue());
+	                return true;
+	            } else if (value instanceof Date) {
+	                // Convert Date to microseconds for BigQuery TIMESTAMP
+	                // BigQuery expects timestamps in microseconds precision
+	                long microseconds = ((Date) value).getTime() * 1000; // Convert millis to micros
+	                builder.setField(field, microseconds);
+	                return true;
+	            }
+	            break;
+	        case DOUBLE:
+	            if (value instanceof Number) {
+	                builder.setField(field, ((Number) value).doubleValue());
+	                return true;
+	            }
+	            break;
+	        case BOOL:
+	            if (value instanceof Boolean) {
+	                builder.setField(field, value);
+	                return true;
+	            }
+	            break;
+	        case STRING:
+	            builder.setField(field, value.toString());
+	            return true;
+	        default:
+	            // For other types, convert to string
+	            builder.setField(field, value.toString());
+	            return true;
+	        }
+	    } catch (Exception e) {
+	        logger.warn("Could not set field '{}' with value '{}': {}", field.getName(), value, e.getMessage());
+	    }
+	    return false;
 	}
 
 	/**

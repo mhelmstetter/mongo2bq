@@ -38,6 +38,7 @@ public class MigrationWorker implements Runnable {
 	private Namespace ns;
 	private Document collectionInfo;
 	private ProtoSchemaConverter converter;
+	private boolean stopRequested = false;
 
 	public MigrationWorker(MongoToBigQueryConfig config, String mongoClientName, Namespace ns,
 			Document collectionInfo) {

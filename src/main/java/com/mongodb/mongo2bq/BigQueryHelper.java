@@ -1,5 +1,7 @@
 package com.mongodb.mongo2bq;
 
+import java.io.FileInputStream;
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Date;
 import java.util.HashMap;
@@ -13,6 +15,8 @@ import org.bson.Document;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.google.api.gax.core.FixedCredentialsProvider;
+import com.google.auth.oauth2.GoogleCredentials;
 import com.google.cloud.bigquery.BigQuery;
 import com.google.cloud.bigquery.BigQueryOptions;
 import com.google.cloud.bigquery.Field;
@@ -24,6 +28,8 @@ import com.google.cloud.bigquery.Table;
 import com.google.cloud.bigquery.TableDefinition;
 import com.google.cloud.bigquery.TableId;
 import com.google.cloud.bigquery.TableInfo;
+import com.google.cloud.bigquery.storage.v1.BigQueryWriteClient;
+import com.google.cloud.bigquery.storage.v1.BigQueryWriteSettings;
 import com.google.protobuf.DescriptorProtos.FieldDescriptorProto.Type;
 import com.mongodb.client.FindIterable;
 import com.mongodb.client.MongoCollection;
@@ -38,6 +44,26 @@ public class BigQueryHelper {
     public static boolean tableExists(BigQuery bigQuery, TableId tableId) {
         return bigQuery.getTable(tableId) != null;
     }
+    
+	public static BigQueryWriteClient createBigQueryClient(MongoToBigQueryConfig config) throws IOException {
+		String serviceAccountKeyPath = config.getServiceAccountKeyPath();
+		GoogleCredentials credentials;
+	    if (serviceAccountKeyPath != null && !serviceAccountKeyPath.isEmpty()) {
+	        // Use explicit service account credentials if provided
+	        try (FileInputStream serviceAccountStream = new FileInputStream(serviceAccountKeyPath)) {
+	            credentials = GoogleCredentials.fromStream(serviceAccountStream);
+	            logger.info("Using service account credentials from: {}", serviceAccountKeyPath);
+	        }
+	    } else {
+	        // Fall back to application default credentials
+	        credentials = GoogleCredentials.getApplicationDefault();
+	        logger.info("Using application default credentials");
+	    }
+	    
+		BigQueryWriteSettings writeSettings = BigQueryWriteSettings.newBuilder()
+				.setCredentialsProvider(FixedCredentialsProvider.create(credentials)).build();
+		return BigQueryWriteClient.create(writeSettings);
+	}
     
     /**
      * Fetch allowed field names from BigQuery table

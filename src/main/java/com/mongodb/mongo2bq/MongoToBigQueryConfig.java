@@ -1,5 +1,6 @@
 package com.mongodb.mongo2bq;
 
+import java.io.FileInputStream;
 import java.io.IOException;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -37,6 +38,7 @@ public class MongoToBigQueryConfig {
 	private static final String SOURCE_MONGO_URIS = "sourceMongoUris";
 	private static final String SOURCE_MONGO_NAMES = "sourceMongoNames";
 	private static final String BATCH_SIZE = "batchSize";
+	private static final String SERVICE_ACCOUNT_KEY_PATH = "serviceAccountKeyPath";
 	
 	private static final String MAX_ROWS_PER_STREAM = "maxRowsPerStream";
 	private static final String MAX_STREAM_DURATION_MINUTES = "maxStreamDurationMinutes";
@@ -67,6 +69,7 @@ public class MongoToBigQueryConfig {
     
     Map<String, MongoClient> mongoClients = new LinkedHashMap<>();
     
+    private String serviceAccountKeyPath;
     private BigQueryWriteClient bigQueryClient;
     private BigQuery bigQuery;
 	
@@ -87,6 +90,7 @@ public class MongoToBigQueryConfig {
 		bqDatasetName = config.getString(DATASET_NAME);
 		sourceMongoUris = config.getStringArray(SOURCE_MONGO_URIS);
 		batchSize = config.getInt(BATCH_SIZE, 10000);
+		serviceAccountKeyPath = config.getString(SERVICE_ACCOUNT_KEY_PATH);
 		
 		maxRowsPerStream = config.getLong(MAX_ROWS_PER_STREAM, DEFAULT_ROWS_PER_STREAM);
 		maxStreamDurationMinutes = config.getLong(MAX_STREAM_DURATION_MINUTES, DEFAULT_STREAM_DURATION_MINUTES);
@@ -106,18 +110,13 @@ public class MongoToBigQueryConfig {
 			mongoClients.put(name, mongoClient);
 		}
 		
-		bigQueryClient = createBigQueryClient();
+		serviceAccountKeyPath = config.getString(SERVICE_ACCOUNT_KEY_PATH);
+		
+		bigQueryClient = BigQueryHelper.createBigQueryClient(this);
 
 		bigQuery = BigQueryOptions.getDefaultInstance().getService();
 		ensureDatasetExists();
     }
-    
-	private static BigQueryWriteClient createBigQueryClient() throws IOException {
-		GoogleCredentials credentials = GoogleCredentials.getApplicationDefault();
-		BigQueryWriteSettings writeSettings = BigQueryWriteSettings.newBuilder()
-				.setCredentialsProvider(FixedCredentialsProvider.create(credentials)).build();
-		return BigQueryWriteClient.create(writeSettings);
-	}
 	
 	private void ensureDatasetExists() {
 		Dataset dataset = bigQuery.getDataset(bqDatasetName);
@@ -127,8 +126,6 @@ public class MongoToBigQueryConfig {
 			logger.info("Created dataset: {}", bqDatasetName);
 		}
 	}
-
-
     
     public MongoClient getMongoClient(String clientName) {
     	MongoClient mc = mongoClients.get(clientName);
@@ -273,6 +270,10 @@ public class MongoToBigQueryConfig {
 
 	public long getMaxMegabytesPerStream() {
 		return maxMegabytesPerStream;
+	}
+
+	public String getServiceAccountKeyPath() {
+		return serviceAccountKeyPath;
 	}
     
     

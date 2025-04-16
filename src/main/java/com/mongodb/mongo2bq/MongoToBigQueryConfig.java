@@ -110,8 +110,6 @@ public class MongoToBigQueryConfig {
 			mongoClients.put(name, mongoClient);
 		}
 		
-		serviceAccountKeyPath = config.getString(SERVICE_ACCOUNT_KEY_PATH);
-		
 		bigQueryClient = BigQueryHelper.createBigQueryClient(this);
 
 		bigQuery = BigQueryOptions.getDefaultInstance().getService();

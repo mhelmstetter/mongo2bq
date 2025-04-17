@@ -448,8 +448,7 @@ public class ProtoSchemaConverter {
 	/**
 	 * Create an AppendRowsRequest with the appropriate schema and rows
 	 */
-	public AppendRowsRequest createAppendRequest(String streamName, List<Document> batch, String tableName,
-	        boolean includeSchema, Set<String> allowedFields) {
+	public AppendRowsRequest createAppendRequest(String streamName, List<Document> batch, String tableName, Set<String> allowedFields) {
 	    
 	    // Always generate schema
 	    ProtoSchema protoSchema = null;

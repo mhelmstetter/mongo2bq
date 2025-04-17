@@ -12,6 +12,7 @@ import org.bson.Document;
 import org.slf4j.LoggerFactory;
 
 import com.google.api.gax.rpc.BidiStream;
+import com.google.api.gax.rpc.InvalidArgumentException;
 import com.google.api.gax.rpc.NotFoundException;
 import com.google.cloud.bigquery.BigQuery;
 import com.google.cloud.bigquery.BigQueryOptions;
@@ -339,25 +340,29 @@ public class MigrationWorker implements Runnable {
 		}
 	}
 
+
 	private void convertAndSendBatch(List<Document> batch, String streamName, String tableName)
 	        throws IOException {
 	    
 	    // Get allowed fields from BigQuery table
 	    Set<String> allowedFields = BigQueryHelper.fetchBigQueryTableFields(config.getGcpProjectId(), config.getBqDatasetName(), tableName);
+
+	    // Add flag to track if schema was updated
+	    boolean schemaUpdated = false;
 	    
-	    // Now we always include schema
-	    AppendRowsRequest request = converter.createAppendRequest(streamName, batch, tableName, true, allowedFields);
+	    AppendRowsRequest request = converter.createAppendRequest(streamName, batch, tableName, allowedFields);
 	            
 	    if (request == null) {
 	        logger.warn("No rows to append after conversion");
 	        return;
 	    }
 	    
-	    // Create a new BidiStream for each batch
-	    BidiStream<AppendRowsRequest, AppendRowsResponse> bidiStream = config.getBigQueryClient().appendRowsCallable()
-	            .call();
-	    
+	    BidiStream<AppendRowsRequest, AppendRowsResponse> bidiStream = null;;
 	    try {
+	        // Create a new BidiStream for each batch
+	        bidiStream = config.getBigQueryClient().appendRowsCallable()
+	                .call();
+	        
 	        // Send the request
 	        bidiStream.send(request);
 	        
@@ -385,16 +390,61 @@ public class MigrationWorker implements Runnable {
 	        } else {
 	            logger.warn("Received empty or incomplete response");
 	        }
-	    } catch (IOException e) {
-	        logger.error("IOException while sending batch", e);
-	        throw e;
-	    } catch (Exception e) {
-	        logger.error("Error while sending batch", e);
-	        throw new IOException("Error sending batch: " + e.getMessage(), e);
+	    } catch (InvalidArgumentException e) {
+	        // Check if error is about schema mismatch
+	        String errorMessage = e.getMessage();
+	        if (errorMessage.contains("Input schema has more fields than BigQuery schema")) {
+	            logger.warn("Schema mismatch detected. Waiting for schema changes to propagate...");
+	            try {
+	                // Wait a bit longer for schema changes to fully propagate
+	                Thread.sleep(10000); // 10 seconds
+	                
+	                // Re-fetch allowed fields after waiting
+	                allowedFields = BigQueryHelper.fetchBigQueryTableFields(config.getGcpProjectId(), config.getBqDatasetName(), tableName);
+	                
+	                // Try creating a new request with refreshed schema
+	                request = converter.createAppendRequest(streamName, batch, tableName, allowedFields);
+	                
+	                if (request == null) {
+	                    throw new IOException("Failed to create request after schema update");
+	                }
+	                
+	                // Create new BidiStream and retry
+	                BidiStream<AppendRowsRequest, AppendRowsResponse> retryStream = 
+	                        config.getBigQueryClient().appendRowsCallable().call();
+	                
+	                logger.info("Retrying batch with updated schema...");
+	                retryStream.send(request);
+	                
+	                // Process response
+	                Iterator<AppendRowsResponse> retryIter = retryStream.iterator();
+	                if (retryIter.hasNext()) {
+	                    AppendRowsResponse retryResponse = retryIter.next();
+	                    if (retryResponse.hasError()) {
+	                        throw new IOException("Error on retry: " + retryResponse.getError().getMessage());
+	                    } else {
+	                        logger.info("Successfully sent batch after schema update");
+	                    }
+	                }
+	                
+	                // Close the retry stream
+	                retryStream.closeSend();
+	                
+	            } catch (InterruptedException ie) {
+	                Thread.currentThread().interrupt();
+	                throw new IOException("Interrupted while waiting for schema update", ie);
+	            }
+	        } else {
+	            // If it's some other error, rethrow
+	            logger.error("Error while sending batch", e);
+	            throw new IOException("Error sending batch: " + e.getMessage(), e);
+	        }
 	    } finally {
 	        // Always close the BidiStream when done
 	        try {
-	            bidiStream.closeSend();
+	        	if (bidiStream != null) {
+	        		bidiStream.closeSend();
+	        	}
 	        } catch (Exception e) {
 	            logger.warn("Error closing BidiStream: {}", e.getMessage());
 	        }

@@ -1,35 +1,18 @@
 package com.mongodb.mongo2bq;
 
+import static com.mongodb.client.model.Filters.eq;
+
 import java.io.IOException;
 import java.util.ArrayList;
-import java.util.Iterator;
+import java.util.Date;
 import java.util.List;
-import java.util.Set;
-import java.util.concurrent.atomic.AtomicLong;
 
-import org.apache.commons.lang3.time.StopWatch;
 import org.bson.Document;
 import org.slf4j.LoggerFactory;
 
-import com.google.api.gax.rpc.BidiStream;
-import com.google.api.gax.rpc.InvalidArgumentException;
-import com.google.api.gax.rpc.NotFoundException;
-import com.google.cloud.bigquery.BigQuery;
-import com.google.cloud.bigquery.BigQueryOptions;
-import com.google.cloud.bigquery.Schema;
-import com.google.cloud.bigquery.Table;
 import com.google.cloud.bigquery.TableId;
-import com.google.cloud.bigquery.storage.v1.AppendRowsRequest;
-import com.google.cloud.bigquery.storage.v1.AppendRowsResponse;
-import com.google.cloud.bigquery.storage.v1.BatchCommitWriteStreamsRequest;
-import com.google.cloud.bigquery.storage.v1.BatchCommitWriteStreamsResponse;
 import com.google.cloud.bigquery.storage.v1.BigQueryWriteClient;
-import com.google.cloud.bigquery.storage.v1.CreateWriteStreamRequest;
-import com.google.cloud.bigquery.storage.v1.FinalizeWriteStreamRequest;
-import com.google.cloud.bigquery.storage.v1.FinalizeWriteStreamResponse;
-import com.google.cloud.bigquery.storage.v1.StorageError;
 import com.google.cloud.bigquery.storage.v1.TableName;
-import com.google.cloud.bigquery.storage.v1.WriteStream;
 import com.mongodb.client.FindIterable;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoCollection;
@@ -42,17 +25,29 @@ public class MigrationWorker implements Runnable {
 
 	private MongoToBigQueryConfig config;
 	private MongoClient mongoClient;
+	
+	private MongoClient metaMongoClient;
+	private MongoDatabase metaMongoDb;
+	private MongoCollection<Document> metaCollection;
+	
 	private Namespace ns;
 	private Document collectionInfo;
 	private ProtoSchemaConverter converter;
 	private boolean stopRequested = false;
+	
+	private String syncStateId;
 	
 	private BigQueryClient bigQueryClient;
     
 	public MigrationWorker(MongoToBigQueryConfig config, String mongoClientName, Namespace ns,
 			Document collectionInfo) {
 		this.config = config;
+		this.syncStateId = mongoClientName + "_" + ns.getDatabaseName() + "_" + ns.getCollectionName();
 		this.mongoClient = config.getMongoClient(mongoClientName);
+		this.metaMongoClient = config.getMetaMongoClient();
+		this.metaMongoDb = metaMongoClient.getDatabase("mongo2bqMeta");
+		this.metaCollection = metaMongoDb.getCollection("syncState");
+		
 		this.ns = ns;
 		this.collectionInfo = collectionInfo;
 		converter = new ProtoSchemaConverter(config);
@@ -77,6 +72,18 @@ public class MigrationWorker implements Runnable {
 	                    ns.getDatabaseName(), collectionInfo);
 	}
 	
+	private Document getSyncStateDocument() {
+		Document syncState = metaCollection.find(eq("_id", syncStateId)).first();
+		if (syncState == null) {
+			syncState = new Document("_id", syncStateId);
+		}
+		return syncState;
+	}
+	
+	private void saveSyncStateDocument(Document syncState) {
+		
+	}
+	
 	private void processCollection(BigQueryWriteClient client, MongoCollection<Document> collection, String dbName,
 			Document collectionInfo) {
 		
@@ -90,7 +97,7 @@ public class MigrationWorker implements Runnable {
             // Initialize stream management
             bigQueryClient.initializeStream(client, tableName, parentTable);
 
-			logger.info("Processing MongoDB Collection: {}.{}", dbName, collectionName);
+			logger.info("Processing MongoDB Collection: {}.{}, type: {}", dbName, collectionName, collectionType);
 
 			if ("collection".equals(collectionType)) {
 				processRegularCollection(collection, dbName, collectionName, client);
@@ -138,9 +145,9 @@ public class MigrationWorker implements Runnable {
 				count++;
 			}
 
-			// If we got no documents, we're done
+			// If we got no documents, loop again
 			if (count == 0) {
-				break;
+				continue;
 			}
 
 			// Send batch to BigQuery
@@ -160,7 +167,7 @@ public class MigrationWorker implements Runnable {
 	}
 
 	private void processTimeSeriesCollection(MongoCollection<Document> collection, Document collectionInfo,
-			String streamName, String dbName, String collectionName, String tableName, BigQueryWriteClient client) {
+			String streamName, String dbName, String collectionName, String tableName, BigQueryWriteClient client) throws Exception {
 		
 		// Extract timeField from collection info
 		Document options = (Document) collectionInfo.get("options");
@@ -169,17 +176,23 @@ public class MigrationWorker implements Runnable {
 
 		// Sort by timeField
 		Document sort = new Document(timeField, 1);
-		Object lastTimeValue = null;
+		Date lastTimeValue = null;
 		boolean isFirstBatch = true;
 		Document savedLookaheadDoc = null;
+		
+		Document syncStateDocument = getSyncStateDocument();
+		lastTimeValue = syncStateDocument.getDate("lastSyncTime");
 
 		while (true) {
 			// Build query - for subsequent batches, filter by timeField > lastTimeValue
 			FindIterable<Document> docs;
-			if (isFirstBatch) {
+			if (isFirstBatch && lastTimeValue.equals(null)) {
 				docs = collection.find().sort(sort);
 				isFirstBatch = false;
 			} else {
+				if (lastTimeValue.equals(null)) {
+					throw new Exception("lastTimeValue not populated");
+				}
 				Document query = new Document(timeField, new Document("$gt", lastTimeValue));
 				docs = collection.find(query).sort(sort);
 			}
@@ -195,13 +208,13 @@ public class MigrationWorker implements Runnable {
 
 			MongoCursor<Document> cursor = docs.iterator();
 
-			Object currentTimeValue = null;
+			Date currentTimeValue = null;
 			boolean batchComplete = false;
 			int count = batch.size(); // Start with the count of any previously saved documents
 
 			while (cursor.hasNext() && !batchComplete) {
 				Document doc = cursor.next();
-				currentTimeValue = doc.get(timeField);
+				currentTimeValue = doc.getDate(timeField);
 
 				// Add document to batch
 				batch.add(doc);
@@ -250,7 +263,7 @@ public class MigrationWorker implements Runnable {
 
 			// If we got no new documents (and no saved document), we're done
 			if (batch.isEmpty()) {
-				break;
+				continue;
 			}
 
 			// Send batch to BigQuery
@@ -260,17 +273,9 @@ public class MigrationWorker implements Runnable {
 					batch.get(batch.size() - 1).get(timeField));
 			try {
 				bigQueryClient.convertAndSendBatch(batch, converter);
-                
-                // Check if we need to rotate the stream
 				bigQueryClient.rotateStreamIfNeeded(client);
-                
 			} catch (IOException e) {
 				logger.error("Error sending batch", e);
-			}
-
-			// If cursor has no more documents and no lookahead saved, we're done
-			if (!cursor.hasNext() && savedLookaheadDoc == null) {
-				break;
 			}
 		}
 	}

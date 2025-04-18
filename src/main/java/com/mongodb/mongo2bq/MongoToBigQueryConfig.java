@@ -1,6 +1,5 @@
 package com.mongodb.mongo2bq;
 
-import java.io.FileInputStream;
 import java.io.IOException;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -15,14 +14,11 @@ import org.apache.commons.configuration2.convert.DefaultListDelimiterHandler;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import com.google.api.gax.core.FixedCredentialsProvider;
-import com.google.auth.oauth2.GoogleCredentials;
 import com.google.cloud.bigquery.BigQuery;
 import com.google.cloud.bigquery.BigQueryOptions;
 import com.google.cloud.bigquery.Dataset;
 import com.google.cloud.bigquery.DatasetInfo;
 import com.google.cloud.bigquery.storage.v1.BigQueryWriteClient;
-import com.google.cloud.bigquery.storage.v1.BigQueryWriteSettings;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 
@@ -35,6 +31,7 @@ public class MongoToBigQueryConfig {
     
     private static final String PROJECT_ID = "gcpProjectId";
 	private static final String DATASET_NAME = "bqDatasetName";
+	private static final String METADATA_MONGO_URI = "metadataMongoUri";
 	private static final String SOURCE_MONGO_URIS = "sourceMongoUris";
 	private static final String SOURCE_MONGO_NAMES = "sourceMongoNames";
 	private static final String BATCH_SIZE = "batchSize";
@@ -61,13 +58,15 @@ public class MongoToBigQueryConfig {
 	private String bqDatasetName;
 	private String[] sourceMongoUris;
 	private String[] sourceMongoNames;
+	private String metaMongoUri;
     private int batchSize;
     
     private long maxRowsPerStream;
     private long maxStreamDurationMinutes;
     private long maxMegabytesPerStream;
     
-    Map<String, MongoClient> mongoClients = new LinkedHashMap<>();
+    private Map<String, MongoClient> mongoClients = new LinkedHashMap<>();
+    private MongoClient metaMongoClient;
     
     private String serviceAccountKeyPath;
     private BigQueryWriteClient bigQueryClient;
@@ -89,6 +88,7 @@ public class MongoToBigQueryConfig {
 		gcpProjectId = config.getString(PROJECT_ID);
 		bqDatasetName = config.getString(DATASET_NAME);
 		sourceMongoUris = config.getStringArray(SOURCE_MONGO_URIS);
+		metaMongoUri = config.getString(METADATA_MONGO_URI);
 		batchSize = config.getInt(BATCH_SIZE, 10000);
 		serviceAccountKeyPath = config.getString(SERVICE_ACCOUNT_KEY_PATH, null);
 		
@@ -109,6 +109,7 @@ public class MongoToBigQueryConfig {
 			String name = sourceMongoNames[i++];
 			mongoClients.put(name, mongoClient);
 		}
+		metaMongoClient = MongoClients.create(metaMongoUri);
 		
 		bigQueryClient = BigQueryClient.createBigQueryClient(this);
 
@@ -272,6 +273,10 @@ public class MongoToBigQueryConfig {
 
 	public String getServiceAccountKeyPath() {
 		return serviceAccountKeyPath;
+	}
+
+	public MongoClient getMetaMongoClient() {
+		return metaMongoClient;
 	}
     
     

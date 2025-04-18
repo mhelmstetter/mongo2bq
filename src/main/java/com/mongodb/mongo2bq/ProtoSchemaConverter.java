@@ -69,7 +69,7 @@ public class ProtoSchemaConverter {
 	    }
 
 	    // Get BigQuery schema for type matching
-	    Map<String, LegacySQLTypeName> bigQueryFields = BigQueryHelper.getBigQueryFieldTypes(config.getGcpProjectId(), config.getBqDatasetName(), tableName);
+	    Map<String, LegacySQLTypeName> bigQueryFields = BigQueryClient.getBigQueryFieldTypes(config.getGcpProjectId(), config.getBqDatasetName(), tableName);
 	    
 	    // Map to store field names and their types
 	    Map<String, Type> fieldTypes = new HashMap<>();
@@ -92,7 +92,7 @@ public class ProtoSchemaConverter {
 	                }
 	                
 	                if (bqType != null) {
-	                    Type protoType = BigQueryHelper.convertBigQueryTypeToProtoType(bqType);
+	                    Type protoType = BigQueryClient.convertBigQueryTypeToProtoType(bqType);
 	                    // Use the original case for the field name
 	                    fieldTypes.put(key, protoType);
 	                } else {
@@ -217,7 +217,7 @@ public class ProtoSchemaConverter {
 			throw new IllegalStateException("Schema not generated for " + tableName);
 		}
 
-		Set<String> knownBQFields = BigQueryHelper.getBigQueryFields(config.getGcpProjectId(), config.getBqDatasetName(), tableName);
+		Set<String> knownBQFields = BigQueryClient.getBigQueryFields(config.getGcpProjectId(), config.getBqDatasetName(), tableName);
 		Set<String> newFieldsThisBatch = new HashSet<>();
 
 		// First pass: identify new fields that need to be added to BigQuery
@@ -337,7 +337,7 @@ public class ProtoSchemaConverter {
 				}
 
 				// Infer the field type from sample documents
-				StandardSQLTypeName fieldType = BigQueryHelper.inferBigQueryFieldType(newField, sampleDocs);
+				StandardSQLTypeName fieldType = BigQueryClient.inferBigQueryFieldType(newField, sampleDocs);
 				Field field = Field.newBuilder(validFieldName, fieldType).setMode(Field.Mode.NULLABLE)
 						.setDescription("Added automatically from MongoDB").build();
 

@@ -110,7 +110,7 @@ public class MongoToBigQueryConfig {
 			mongoClients.put(name, mongoClient);
 		}
 		
-		bigQueryClient = BigQueryHelper.createBigQueryClient(this);
+		bigQueryClient = BigQueryClient.createBigQueryClient(this);
 
 		bigQuery = BigQueryOptions.getDefaultInstance().getService();
 		ensureDatasetExists();

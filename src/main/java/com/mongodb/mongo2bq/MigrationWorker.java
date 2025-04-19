@@ -8,6 +8,7 @@ import java.util.Date;
 import java.util.List;
 
 import org.bson.Document;
+import org.bson.conversions.Bson;
 import org.slf4j.LoggerFactory;
 
 import com.google.cloud.bigquery.TableId;
@@ -18,6 +19,8 @@ import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoCursor;
 import com.mongodb.client.MongoDatabase;
+import com.mongodb.client.model.UpdateOptions;
+import com.mongodb.client.model.Updates;
 
 public class MigrationWorker implements Runnable {
 
@@ -25,20 +28,21 @@ public class MigrationWorker implements Runnable {
 
 	private MongoToBigQueryConfig config;
 	private MongoClient mongoClient;
-	
+
 	private MongoClient metaMongoClient;
 	private MongoDatabase metaMongoDb;
 	private MongoCollection<Document> metaCollection;
-	
+
 	private Namespace ns;
 	private Document collectionInfo;
 	private ProtoSchemaConverter converter;
 	private boolean stopRequested = false;
-	
+
 	private String syncStateId;
-	
+	private boolean upsertSyncState = true;
+
 	private BigQueryClient bigQueryClient;
-    
+
 	public MigrationWorker(MongoToBigQueryConfig config, String mongoClientName, Namespace ns,
 			Document collectionInfo) {
 		this.config = config;
@@ -47,7 +51,7 @@ public class MigrationWorker implements Runnable {
 		this.metaMongoClient = config.getMetaMongoClient();
 		this.metaMongoDb = metaMongoClient.getDatabase("mongo2bqMeta");
 		this.metaCollection = metaMongoDb.getCollection("syncState");
-		
+
 		this.ns = ns;
 		this.collectionInfo = collectionInfo;
 		converter = new ProtoSchemaConverter(config);
@@ -56,37 +60,47 @@ public class MigrationWorker implements Runnable {
 
 	@Override
 	public void run() {
-	    TableId tableId = TableId.of(config.getBqDatasetName(), ns.getDatabaseName() + "_" + ns.getCollectionName());
-	    MongoDatabase db = mongoClient.getDatabase(ns.getDatabaseName());
+		TableId tableId = TableId.of(config.getBqDatasetName(), ns.getDatabaseName() + "_" + ns.getCollectionName());
+		MongoDatabase db = mongoClient.getDatabase(ns.getDatabaseName());
 
-	    if (!BigQueryClient.tableExists(config.getBigQuery(), tableId)) {
-	        BigQueryClient.createBigQueryTable(config.getBigQuery(), db.getCollection(ns.getCollectionName()), tableId);
-	        
-	        BigQueryClient.waitForTableFullyAvailable(config, tableId);
-	    } else {
-	        logger.debug("BigQuery table already exists: {}", tableId);
-	    }
-	    
-	    // Only proceed to process the collection if we have a table
-	    processCollection(config.getBigQueryClient(), db.getCollection(ns.getCollectionName()), 
-	                    ns.getDatabaseName(), collectionInfo);
+		if (!BigQueryClient.tableExists(config.getBigQuery(), tableId)) {
+			BigQueryClient.createBigQueryTable(config.getBigQuery(), db.getCollection(ns.getCollectionName()), tableId);
+
+			BigQueryClient.waitForTableFullyAvailable(config, tableId);
+		} else {
+			logger.debug("BigQuery table already exists: {}", tableId);
+		}
+
+		// Only proceed to process the collection if we have a table
+		processCollection(config.getBigQueryClient(), db.getCollection(ns.getCollectionName()), ns.getDatabaseName(),
+				collectionInfo);
 	}
-	
-	private Document getSyncStateDocument() {
+
+	private Date getSyncStateLastTimeField() {
 		Document syncState = metaCollection.find(eq("_id", syncStateId)).first();
 		if (syncState == null) {
-			syncState = new Document("_id", syncStateId);
+			return null;
 		}
-		return syncState;
+		return syncState.getDate("lastTimeField");
 	}
-	
-	private void saveSyncStateDocument(Document syncState) {
+
+	private void saveSyncState(Date lastTimeValue) {
+		//syncStateDocument.append("lastSyncTime", lastTimeValue);
 		
+		UpdateOptions options = (upsertSyncState) ? new UpdateOptions().upsert(true) : new UpdateOptions();
+		
+		Bson updateOperations = Updates.combine(
+            Updates.set("lastTimeField", lastTimeValue),
+            Updates.set("lastCommit", new Date())
+        );
+		
+		metaCollection.updateOne(eq("_id", syncStateId), updateOperations, options);
+		upsertSyncState = false;
 	}
-	
+
 	private void processCollection(BigQueryWriteClient client, MongoCollection<Document> collection, String dbName,
 			Document collectionInfo) {
-		
+
 		String collectionName = collectionInfo.getString("name");
 		try {
 			String collectionType = collectionInfo.getString("type");
@@ -94,29 +108,30 @@ public class MigrationWorker implements Runnable {
 			String parentTable = TableName.of(config.getGcpProjectId(), config.getBqDatasetName(), tableName)
 					.toString();
 
-            // Initialize stream management
-            bigQueryClient.initializeStream(client, tableName, parentTable);
+			// Initialize stream management
+			bigQueryClient.initializeStream(client, tableName, parentTable);
 
 			logger.info("Processing MongoDB Collection: {}.{}, type: {}", dbName, collectionName, collectionType);
 
 			if ("collection".equals(collectionType)) {
 				processRegularCollection(collection, dbName, collectionName, client);
 			} else if ("timeseries".equals(collectionType)) {
-				processTimeSeriesCollection(collection, collectionInfo, dbName, collectionName, tableName, parentTable, client);
+				processTimeSeriesCollection(collection, collectionInfo, dbName, collectionName, tableName, parentTable,
+						client);
 			} else {
 				logger.debug("Skipping collection type: {}, name: {}", collectionType, collectionName);
 				return;
 			}
 
-            bigQueryClient.finalizeAndCommitStream(client, parentTable);
+			bigQueryClient.finalizeAndCommitStream(client, parentTable);
 
 		} catch (Exception e) {
 			logger.error("Error processing collection {}.{}", dbName, collectionName, e);
 		}
 	}
 
-	private void processRegularCollection(MongoCollection<Document> collection, String dbName,
-			String collectionName, BigQueryWriteClient client) {
+	private void processRegularCollection(MongoCollection<Document> collection, String dbName, String collectionName,
+			BigQueryWriteClient client) {
 		// Start with initial sort on _id
 		Document sort = new Document("_id", 1);
 		Object lastId = null;
@@ -151,10 +166,11 @@ public class MigrationWorker implements Runnable {
 			}
 
 			// Send batch to BigQuery
-			logger.info("Sending batch of {} documents from {}.{} (regular collection)", batch.size(), dbName, collectionName);
+			logger.info("Sending batch of {} documents from {}.{} (regular collection)", batch.size(), dbName,
+					collectionName);
 			try {
 				bigQueryClient.convertAndSendBatch(batch, converter);
-                bigQueryClient.rotateStreamIfNeeded(client);
+				bigQueryClient.rotateStreamIfNeeded(client);
 			} catch (IOException e) {
 				logger.error("Error sending batch", e);
 			}
@@ -167,8 +183,9 @@ public class MigrationWorker implements Runnable {
 	}
 
 	private void processTimeSeriesCollection(MongoCollection<Document> collection, Document collectionInfo,
-			String streamName, String dbName, String collectionName, String tableName, BigQueryWriteClient client) throws Exception {
-		
+			String streamName, String dbName, String collectionName, String tableName, BigQueryWriteClient client)
+			throws Exception {
+
 		// Extract timeField from collection info
 		Document options = (Document) collectionInfo.get("options");
 		Document timeseries = (Document) options.get("timeseries");
@@ -179,18 +196,19 @@ public class MigrationWorker implements Runnable {
 		Date lastTimeValue = null;
 		boolean isFirstBatch = true;
 		Document savedLookaheadDoc = null;
-		
-		Document syncStateDocument = getSyncStateDocument();
-		lastTimeValue = syncStateDocument.getDate("lastSyncTime");
+
+		lastTimeValue = getSyncStateLastTimeField();
+
+		logger.debug("{} lastSyncTime: {} from syncState document in metadb", syncStateId, lastTimeValue);
 
 		while (true) {
 			// Build query - for subsequent batches, filter by timeField > lastTimeValue
 			FindIterable<Document> docs;
-			if (isFirstBatch && lastTimeValue.equals(null)) {
+			if (isFirstBatch && lastTimeValue == null) {
 				docs = collection.find().sort(sort);
 				isFirstBatch = false;
 			} else {
-				if (lastTimeValue.equals(null)) {
+				if (lastTimeValue == null) {
 					throw new Exception("lastTimeValue not populated");
 				}
 				Document query = new Document(timeField, new Document("$gt", lastTimeValue));
@@ -273,6 +291,7 @@ public class MigrationWorker implements Runnable {
 					batch.get(batch.size() - 1).get(timeField));
 			try {
 				bigQueryClient.convertAndSendBatch(batch, converter);
+				saveSyncState(lastTimeValue);
 				bigQueryClient.rotateStreamIfNeeded(client);
 			} catch (IOException e) {
 				logger.error("Error sending batch", e);

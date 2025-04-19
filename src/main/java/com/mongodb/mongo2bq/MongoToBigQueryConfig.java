@@ -42,7 +42,7 @@ public class MongoToBigQueryConfig {
 	private static final String MAX_MEGABYTES_PER_STREAM = "maxMegabytesPerStream";
 	
     // Constants that control when to finalize streams
-    private static final long DEFAULT_ROWS_PER_STREAM = 1_000_000; // 1 million rows
+    private static final long DEFAULT_ROWS_PER_STREAM = 100_000; // 1 million rows
     private static final long DEFAULT_STREAM_DURATION_MINUTES = 30; // 30 minutes
     private static final long DEFAULT_MEGABYTES_PER_STREAM = 4096; // 4 GB
     

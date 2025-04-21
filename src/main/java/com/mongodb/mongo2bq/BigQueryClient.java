@@ -215,151 +215,247 @@ public class BigQueryClient {
      * Finalize and commit a stream
      */
     public void finalizeAndCommitStream(BigQueryWriteClient client, String parentTable) {
-        try {
-        	
-            logger.info("Finalizing stream: {}", currentStreamName);
-            
-            // Send finalize request
-            FinalizeWriteStreamRequest finalizeRequest = FinalizeWriteStreamRequest.newBuilder()
-                .setName(currentStreamName)
-                .build();
-            
-            FinalizeWriteStreamResponse finalizeResponse = client.finalizeWriteStream(finalizeRequest);
-            logger.info("Stream finalized: {}, row count: {}", currentStreamName, finalizeResponse.getRowCount());
-            
-            // Commit the stream
-            BatchCommitWriteStreamsRequest commitRequest = BatchCommitWriteStreamsRequest.newBuilder()
-                .setParent(parentTable)
-                .addWriteStreams(currentStreamName)
-                .build();
-            
-            BatchCommitWriteStreamsResponse commitResponse = client.batchCommitWriteStreams(commitRequest);
-            
-            // Check for errors
-            List<StorageError> errors = commitResponse.getStreamErrorsList();
-            for (StorageError e : errors) {
-                logger.error(e.getErrorMessage());
+        int maxRetries = 3;
+        int retryCount = 0;
+        long retryDelayMs = 1000;
+        
+        while (retryCount < maxRetries) {
+            try {
+                logger.info("Finalizing stream: {}", currentStreamName);
+                
+                // Send finalize request
+                FinalizeWriteStreamRequest finalizeRequest = FinalizeWriteStreamRequest.newBuilder()
+                    .setName(currentStreamName)
+                    .build();
+                
+                FinalizeWriteStreamResponse finalizeResponse = client.finalizeWriteStream(finalizeRequest);
+                logger.info("Stream finalized: {}, row count: {}", currentStreamName, finalizeResponse.getRowCount());
+                
+                // Commit the stream
+                BatchCommitWriteStreamsRequest commitRequest = BatchCommitWriteStreamsRequest.newBuilder()
+                    .setParent(parentTable)
+                    .addWriteStreams(currentStreamName)
+                    .build();
+                
+                BatchCommitWriteStreamsResponse commitResponse = client.batchCommitWriteStreams(commitRequest);
+                
+                // Check for errors
+                List<StorageError> errors = commitResponse.getStreamErrorsList();
+                if (!errors.isEmpty()) {
+                    StringBuilder errorMsg = new StringBuilder("Stream errors encountered:");
+                    for (StorageError e : errors) {
+                        errorMsg.append(" ").append(e.getErrorMessage());
+                    }
+                    logger.error(errorMsg.toString());
+                    
+                    // If we have errors, retry if we haven't exceeded max retries
+                    retryCount++;
+                    if (retryCount < maxRetries) {
+                        logger.info("Retrying commit after errors (attempt {}/{})", retryCount, maxRetries);
+                        Thread.sleep(retryDelayMs * retryCount); // Simple backoff
+                        continue;
+                    } else {
+                        throw new RuntimeException("Failed to commit stream after " + maxRetries + " attempts: " + errorMsg);
+                    }
+                }
+                
+                if (commitResponse.hasCommitTime()) {
+                    logger.info("Stream committed successfully at {}", commitResponse.getCommitTime());
+                    return; // Success - exit method
+                } else {
+                    logger.error("Commit response has no commit time for stream {}", currentStreamName);
+                    
+                    // Retry if we haven't exceeded max retries
+                    retryCount++;
+                    if (retryCount < maxRetries) {
+                        logger.info("Retrying commit (attempt {}/{})", retryCount, maxRetries);
+                        Thread.sleep(retryDelayMs * retryCount); // Simple backoff
+                    } else {
+                        throw new RuntimeException("Failed to commit stream after " + maxRetries + " attempts: no commit time received");
+                    }
+                }
+            } catch (Exception e) {
+                logger.error("Error finalizing/committing stream: {}", e.getMessage(), e);
+                
+                // Retry if we haven't exceeded max retries
+                retryCount++;
+                if (retryCount < maxRetries) {
+                    try {
+                        logger.info("Retrying after error (attempt {}/{})", retryCount, maxRetries);
+                        Thread.sleep(retryDelayMs * retryCount); // Simple backoff
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        throw new RuntimeException("Interrupted during retry", ie);
+                    }
+                } else {
+                    throw new RuntimeException("Failed to finalize/commit stream after " + maxRetries + " attempts", e);
+                }
             }
-            
-            if (commitResponse.hasCommitTime()) {
-                logger.info("Stream committed successfully at {}", commitResponse.getCommitTime());
-            } else {
-                logger.error("Commit failed for stream {}", currentStreamName);
-            }
-        } catch (Exception e) {
-            logger.error("Error finalizing/committing stream: {}", e.getMessage(), e);
         }
+        
+        // If we get here, we've exhausted our retries
+        throw new RuntimeException("Failed to finalize/commit stream " + currentStreamName + " after " + maxRetries + " attempts");
     }
     
-	public void convertAndSendBatch(List<Document> batch, ProtoSchemaConverter converter)
-	        throws IOException {
-	    
-	    // Get allowed fields from BigQuery table
-	    Set<String> allowedFields = BigQueryClient.fetchBigQueryTableFields(config.getGcpProjectId(), config.getBqDatasetName(), tableName);
+    public void convertAndSendBatch(List<Document> batch, ProtoSchemaConverter converter)
+            throws IOException {
+        
+        // Get allowed fields from BigQuery table
+        Set<String> allowedFields = BigQueryClient.fetchBigQueryTableFields(config.getGcpProjectId(), config.getBqDatasetName(), tableName);
 
-	    // Add flag to track if schema was updated
-	    boolean schemaUpdated = false;
-	    
-	    AppendRowsRequest request = converter.createAppendRequest(currentStreamName, batch, tableName, allowedFields);
-	            
-	    if (request == null) {
-	        logger.warn("No rows to append after conversion");
-	        return;
-	    }
-	    
-	    BidiStream<AppendRowsRequest, AppendRowsResponse> bidiStream = null;;
-	    try {
-	        // Create a new BidiStream for each batch
-	        bidiStream = config.getBigQueryClient().appendRowsCallable()
-	                .call();
-	        
-	        // Send the request
-	        bidiStream.send(request);
-	        
-	        // Get the first response
-	        AppendRowsResponse response = null;
-	        Iterator<AppendRowsResponse> responseIter = bidiStream.iterator();
-	        if (responseIter.hasNext()) {
-	            response = responseIter.next();
-	        }
-	        
-	        // Process the response
-	        if (response != null && response.hasError()) {
-	            logger.error("Error in append response: {}", response.getError().getMessage());
-	            throw new IOException("Error appending rows: " + response.getError().getMessage());
-	        } else if (response != null && response.hasAppendResult()) {
-	            long estimatedBytes = request.getProtoRows().getSerializedSize();
-	            int rowCount = request.getProtoRows().getRows().getSerializedRowsCount();
-	            
-	            // Update counters for stream rotation logic
-	            rowsWritten.addAndGet(rowCount);
-	            bytesWritten.addAndGet(estimatedBytes);
-	            
-	            logger.info("Successfully appended batch with offset: {}",
-	                    response.getAppendResult().getOffset().getValue());
-	        } else {
-	            logger.warn("Received empty or incomplete response");
-	        }
-	    } catch (InvalidArgumentException e) {
-	        // Check if error is about schema mismatch
-	        String errorMessage = e.getMessage();
-	        if (errorMessage.contains("Input schema has more fields than BigQuery schema")) {
-	            logger.warn("Schema mismatch detected. Waiting for schema changes to propagate...");
-	            try {
-	                // Wait a bit longer for schema changes to fully propagate
-	                Thread.sleep(10000); // 10 seconds
-	                
-	                // Re-fetch allowed fields after waiting
-	                allowedFields = BigQueryClient.fetchBigQueryTableFields(config.getGcpProjectId(), config.getBqDatasetName(), tableName);
-	                
-	                // Try creating a new request with refreshed schema
-	                request = converter.createAppendRequest(currentStreamName, batch, tableName, allowedFields);
-	                
-	                if (request == null) {
-	                    throw new IOException("Failed to create request after schema update");
-	                }
-	                
-	                // Create new BidiStream and retry
-	                BidiStream<AppendRowsRequest, AppendRowsResponse> retryStream = 
-	                        config.getBigQueryClient().appendRowsCallable().call();
-	                
-	                logger.info("Retrying batch with updated schema...");
-	                retryStream.send(request);
-	                
-	                // Process response
-	                Iterator<AppendRowsResponse> retryIter = retryStream.iterator();
-	                if (retryIter.hasNext()) {
-	                    AppendRowsResponse retryResponse = retryIter.next();
-	                    if (retryResponse.hasError()) {
-	                        throw new IOException("Error on retry: " + retryResponse.getError().getMessage());
-	                    } else {
-	                        logger.info("Successfully sent batch after schema update");
-	                    }
-	                }
-	                
-	                // Close the retry stream
-	                retryStream.closeSend();
-	                
-	            } catch (InterruptedException ie) {
-	                Thread.currentThread().interrupt();
-	                throw new IOException("Interrupted while waiting for schema update", ie);
-	            }
-	        } else {
-	            // If it's some other error, rethrow
-	            logger.error("Error while sending batch", e);
-	            throw new IOException("Error sending batch: " + e.getMessage(), e);
-	        }
-	    } finally {
-	        // Always close the BidiStream when done
-	        try {
-	        	if (bidiStream != null) {
-	        		bidiStream.closeSend();
-	        	}
-	        } catch (Exception e) {
-	            logger.warn("Error closing BidiStream: {}", e.getMessage());
-	        }
-	    }
-	}
+        // Add flag to track if schema was updated
+        boolean schemaUpdated = false;
+        
+        AppendRowsRequest request = converter.createAppendRequest(currentStreamName, batch, tableName, allowedFields);
+                
+        if (request == null) {
+            logger.warn("No rows to append after conversion");
+            return;
+        }
+        
+        BidiStream<AppendRowsRequest, AppendRowsResponse> bidiStream = null;
+        try {
+            // Create a new BidiStream for each batch
+            bidiStream = config.getBigQueryClient().appendRowsCallable()
+                    .call();
+            
+            // Send the request
+            bidiStream.send(request);
+            
+            // Get the first response
+            AppendRowsResponse response = null;
+            Iterator<AppendRowsResponse> responseIter = bidiStream.iterator();
+            if (responseIter.hasNext()) {
+                response = responseIter.next();
+            }
+            
+            // Process the response
+            if (response != null && response.hasError()) {
+                logger.error("Error in append response: {}", response.getError().getMessage());
+                throw new IOException("Error appending rows: " + response.getError().getMessage());
+            } else if (response != null && response.hasAppendResult()) {
+                long estimatedBytes = request.getProtoRows().getSerializedSize();
+                int rowCount = request.getProtoRows().getRows().getSerializedRowsCount();
+                
+                // Update counters for stream rotation logic
+                rowsWritten.addAndGet(rowCount);
+                bytesWritten.addAndGet(estimatedBytes);
+                
+                logger.info("Successfully appended batch with offset: {}",
+                        response.getAppendResult().getOffset().getValue());
+            } else {
+                logger.warn("Received empty or incomplete response");
+            }
+        } catch (InvalidArgumentException e) {
+            // Check if error is about schema mismatch
+            String errorMessage = e.getMessage();
+            if (errorMessage.contains("Input schema has more fields than BigQuery schema")) {
+                logger.warn("Schema mismatch detected. Waiting for schema changes to propagate...");
+                
+                // Implement exponential backoff for schema updates
+                int retryCount = 0;
+                int maxRetries = 5;
+                long initialBackoffMs = 5000; // 5 seconds
+                
+                while (retryCount < maxRetries) {
+                    try {
+                        long backoffMs = initialBackoffMs * (long)Math.pow(2, retryCount);
+                        logger.info("Waiting {} ms for schema update to propagate (attempt {}/{})", 
+                                  backoffMs, retryCount + 1, maxRetries);
+                        Thread.sleep(backoffMs);
+                        
+                        // Verify schema update by checking fields again
+                        Set<String> updatedFields = BigQueryClient.fetchBigQueryTableFields(
+                                config.getGcpProjectId(), config.getBqDatasetName(), tableName);
+                        
+                        // Check if all fields in batch are now in the schema
+                        boolean allFieldsPresent = true;
+                        for (Document doc : batch) {
+                            for (String field : doc.keySet()) {
+                                String validFieldName = ProtoSchemaConverter.makeValidProtoFieldName(field);
+                                boolean fieldExists = false;
+                                
+                                for (String existingField : updatedFields) {
+                                    if (existingField.equalsIgnoreCase(validFieldName)) {
+                                        fieldExists = true;
+                                        break;
+                                    }
+                                }
+                                
+                                if (!fieldExists) {
+                                    allFieldsPresent = false;
+                                    break;
+                                }
+                            }
+                            if (!allFieldsPresent) break;
+                        }
+                        
+                        if (allFieldsPresent) {
+                            logger.info("Schema update confirmed. All fields are now present in BigQuery schema.");
+                            
+                            // Create new request with updated schema
+                            request = converter.createAppendRequest(currentStreamName, batch, tableName, updatedFields);
+                            
+                            if (request == null) {
+                                throw new IOException("Failed to create request after schema update");
+                            }
+                            
+                            // Create new BidiStream and retry
+                            BidiStream<AppendRowsRequest, AppendRowsResponse> retryStream = 
+                                    config.getBigQueryClient().appendRowsCallable().call();
+                            
+                            try {
+                                logger.info("Retrying batch with updated schema...");
+                                retryStream.send(request);
+                                
+                                // Process response
+                                Iterator<AppendRowsResponse> retryIter = retryStream.iterator();
+                                if (retryIter.hasNext()) {
+                                    AppendRowsResponse retryResponse = retryIter.next();
+                                    if (retryResponse.hasError()) {
+                                        throw new IOException("Error on retry: " + retryResponse.getError().getMessage());
+                                    } else {
+                                        logger.info("Successfully sent batch after schema update");
+                                        return; // Success, exit method
+                                    }
+                                }
+                            } finally {
+                                // Always close the retry stream
+                                try {
+                                    retryStream.closeSend();
+                                } catch (Exception closeEx) {
+                                    logger.warn("Error closing retry BidiStream: {}", closeEx.getMessage());
+                                }
+                            }
+                        } else {
+                            logger.warn("Schema update not yet complete, some fields still missing. Retrying...");
+                        }
+                        
+                        retryCount++;
+                        
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        throw new IOException("Interrupted while waiting for schema update", ie);
+                    }
+                }
+                
+                throw new IOException("Failed to confirm schema update after " + maxRetries + " attempts");
+            } else {
+                // If it's some other error, rethrow
+                logger.error("Error while sending batch", e);
+                throw new IOException("Error sending batch: " + e.getMessage(), e);
+            }
+        } finally {
+            // Always close the BidiStream when done
+            try {
+                if (bidiStream != null) {
+                    bidiStream.closeSend();
+                }
+            } catch (Exception e) {
+                logger.warn("Error closing BidiStream: {}", e.getMessage());
+            }
+        }
+    }
      
 	public static BigQueryWriteClient createBigQueryClient(MongoToBigQueryConfig config) throws IOException {
 		String serviceAccountKeyPath = config.getServiceAccountKeyPath();

@@ -164,7 +164,7 @@ public class ProtoSchemaConverter {
 	/**
 	 * Make field names protobuf-compatible
 	 */
-	private static String makeValidProtoFieldName(String name) {
+	public static String makeValidProtoFieldName(String name) {
 	    // Replace any invalid character with underscore
 	    String validName = name.replaceAll("[^a-zA-Z0-9_]", "_");
 
